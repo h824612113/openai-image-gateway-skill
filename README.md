@@ -1,29 +1,33 @@
-# openai-image-gateway
+# OpenAI Image Gateway Skill
 
 Standalone Codex skill for generating images through an OpenAI-compatible gateway with one-time local configuration.
 
-## Marketplace submission type
+## What this repository contains
+
+This repository publishes one standalone skill:
+
+- `skills/openai-image-gateway`
+
+The skill lets a user:
+
+- save `base_url`, `api_key`, and default `model` once
+- test connectivity through `/v1/models`
+- generate an image from text and save it to a local file path
+
+## Codex Marketplace submission target
 
 Submit this repository to Codex Marketplace as:
 
-- `SKILL` for the whole repo, or
-- `owner/repo/skills/openai-image-gateway` for the single skill path
+- type: `SKILL`
+- target: `h824612113/openai-image-gateway-skill/skills/openai-image-gateway`
 
 ## Install
 
-Example:
-
 ```bash
-npx codex-marketplace add owner/repo/skills/openai-image-gateway --skill
+npx codex-marketplace add h824612113/openai-image-gateway-skill/skills/openai-image-gateway --skill
 ```
 
-## What it does
-
-- Save `base_url`, `api_key`, and default `model` once
-- Test connectivity with `/v1/models`
-- Generate an image to a local file path
-
-## Files
+## Repository layout
 
 ```text
 skills/
@@ -35,7 +39,7 @@ skills/
 
 ## User setup after install
 
-Users must provide their own gateway URL and API key:
+Users must provide their own gateway URL and API key. No real credentials are included in this repository.
 
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py config \
@@ -44,19 +48,27 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py co
   --model gpt-image-2
 ```
 
-Then test:
+Test connectivity:
 
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py test
 ```
 
-Generate:
+Generate an image:
 
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
   --prompt "cyberpunk city at night" \
   --out ~/Downloads/city.png
 ```
+
+## Natural language usage
+
+After install and config, users can invoke it in Codex with prompts like:
+
+- `用 openai-image-gateway 生图，保存到 /path/to/file.png`
+- `用我上次那个中转生图，输出到 /path/to/file.png`
+- `用 openai-image-gateway 测一下连接`
 
 ## Requirements
 
@@ -67,3 +79,4 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py ge
 
 - This repository does not contain any real gateway URL or API key
 - Users must create their own local config after installation
+- Local secrets should stay in `local_config.json`, which should not be committed
