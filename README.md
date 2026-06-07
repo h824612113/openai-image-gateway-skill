@@ -14,13 +14,6 @@ The skill lets a user:
 - test connectivity through `/v1/models`
 - generate an image from text and save it to a local file path
 
-## Codex Marketplace submission target
-
-Submit this repository to Codex Marketplace as:
-
-- type: `SKILL`
-- target: `h824612113/openai-image-gateway-skill/skills/openai-image-gateway`
-
 ## Install
 
 ```bash
