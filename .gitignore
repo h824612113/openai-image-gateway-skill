@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.DS_Store
+skills/openai-image-gateway/local_config.json
