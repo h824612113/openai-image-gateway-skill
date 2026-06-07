@@ -67,7 +67,7 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py ge
 After install and config, users can invoke it in Codex with prompts like:
 
 - `用 openai-image-gateway 生图，保存到 /path/to/file.png`
-- `用我上次那个中转生图，输出到 /path/to/file.png`
+- `用图片网关生图，输出到 /path/to/file.png`
 - `用 openai-image-gateway 测一下连接`
 
 ## Requirements

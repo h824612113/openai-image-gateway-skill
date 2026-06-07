@@ -1,6 +1,6 @@
 ---
 name: openai-image-gateway
-description: Use an OpenAI-compatible image gateway for text-to-image generation with one-time local config. Trigger when the user says things like "用 openai-image-gateway", "用我上次那个中转生图", "用已保存的 URL 和 key 生图", "测试中转连接", "重新配置中转", or wants to generate an image to a specified local output path by giving a prompt and path.
+description: Use an OpenAI-compatible image gateway for text-to-image generation with one-time local config. Trigger when the user asks to generate an image through a configured gateway, test gateway connectivity, update gateway settings, or save generated output to a specified local path.
 ---
 
 # OpenAI Image Gateway
@@ -16,8 +16,8 @@ Use this skill when the user wants a reusable local image-generation workflow ba
 ## Common Chinese invocations
 
 - `用 openai-image-gateway 生图，输出到 /path/to/file.png`
-- `用我上次那个中转生图，保存到 /path/to/file.png`
-- `用已保存的 URL 和 key 生成图片到 /path/to/file.png`
+- `用图片网关生图，保存到 /path/to/file.png`
+- `生成图片并输出到 /path/to/file.png`
 - `用 openai-image-gateway 测一下连接`
 - `用 openai-image-gateway 重新配置 url 和 key`
 
