@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import mimetypes
 import os
 import sys
 from pathlib import Path
@@ -166,15 +167,29 @@ def command_generate(args):
     if output_format in {"jpeg", "webp"}:
         payload["output_compression"] = args.compression
 
-    resp = requests.post(
-        f"{cfg['base_url']}/images/generations",
-        headers={
-            "Authorization": f"Bearer {cfg['api_key']}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=args.timeout,
-    )
+    if args.image:
+        image_path = Path(args.image).expanduser()
+        if not image_path.is_file():
+            fail(f"Reference image not found: {image_path}")
+        mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
+        with image_path.open("rb") as image_file:
+            resp = requests.post(
+                f"{cfg['base_url']}/images/edits",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                data={key: str(value) for key, value in payload.items()},
+                files={"image": (image_path.name, image_file, mime_type)},
+                timeout=args.timeout,
+            )
+    else:
+        resp = requests.post(
+            f"{cfg['base_url']}/images/generations",
+            headers={
+                "Authorization": f"Bearer {cfg['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=args.timeout,
+        )
     if resp.status_code != 200:
         fail(f"HTTP {resp.status_code}: {error_text(resp)}")
 
@@ -188,6 +203,7 @@ def command_generate(args):
     print(f"Saved image: {out_path}")
     print(f"Bytes: {len(raw)}")
     print(f"Model: {model}")
+    print(f"Mode: {'edit' if args.image else 'generate'}")
 
 
 def build_parser():
@@ -207,6 +223,7 @@ def build_parser():
     gen_parser = sub.add_parser("generate", help="Generate an image to a target path")
     gen_parser.add_argument("--prompt", required=True, help="Prompt text")
     gen_parser.add_argument("--out", required=True, help="Target file path")
+    gen_parser.add_argument("--image", help="Reference image path for edit mode")
     gen_parser.add_argument("--size", default="1024x1024", help="Image size or auto")
     gen_parser.add_argument("--quality", default="auto", choices=["auto", "low", "medium", "high"])
     gen_parser.add_argument("--format", choices=["png", "jpeg", "webp"], help="Output format")

@@ -13,6 +13,7 @@ The skill lets a user:
 - save `base_url`, `api_key`, and default `model` once
 - test connectivity through `/v1/models`
 - generate an image from text and save it to a local file path
+- generate a new image from a reference image and prompt
 
 ## Install
 
@@ -55,9 +56,22 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py ge
   --out ~/Downloads/city.png
 ```
 
+Generate from a reference image:
+
+```bash
+python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --image ~/Pictures/reference.png \
+  --prompt "turn this into a clean product render on a white background" \
+  --out ~/Downloads/product.png
+```
+
 ## Natural language usage
 
 After install and config, users can invoke it in Codex with prompts like:
+
+- `Use openai-image-gateway to generate a cyberpunk city and save it to /path/to/city.png`
+- `Use /path/to/reference.png as a reference image, turn it into a clean product render, and save to /path/to/product.png`
+- `用 /path/to/reference.png 做参考图，生成白底商品渲染图，保存到 /path/to/product.png`
 
 - `用 openai-image-gateway 生图，保存到 /path/to/file.png`
 - `用图片网关生图，输出到 /path/to/file.png`
