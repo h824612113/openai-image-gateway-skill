@@ -1,5 +1,6 @@
 {
   "base_url": "https://example.com/",
   "api_key": "PUT_YOUR_KEY_HERE",
-  "model": "gpt-image-2"
+  "model": "gpt-image-2",
+  "responses_model": "gpt-image"
 }

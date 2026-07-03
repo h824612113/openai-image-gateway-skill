@@ -24,9 +24,22 @@ def normalize_base_url(raw):
     raw = (raw or "").strip().rstrip("/")
     if not raw:
         return ""
+    if raw.endswith("/responses"):
+        raw = raw[: -len("/responses")].rstrip("/")
     if raw.endswith("/v1"):
         return raw
     return f"{raw}/v1"
+
+
+def responses_endpoint(raw):
+    raw = (raw or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.endswith("/responses"):
+        return raw
+    if raw.endswith("/v1"):
+        raw = raw[:-3].rstrip("/")
+    return f"{raw}/responses"
 
 
 def mask_key(key):
@@ -40,16 +53,26 @@ def load_config():
     if not CONFIG_PATH.exists():
         fail(f"Config not found: {CONFIG_PATH}")
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        # Accept UTF-8 files with or without BOM because some Windows editors add it.
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         fail(f"Invalid config JSON: {exc}")
 
-    base_url = normalize_base_url(data.get("base_url", ""))
+    raw_base_url = (data.get("base_url", "") or "").strip().rstrip("/")
+    base_url = normalize_base_url(raw_base_url)
     api_key = (data.get("api_key", "") or "").strip()
     model = (data.get("model", "") or DEFAULT_MODEL).strip()
+    responses_model = (data.get("responses_model", "") or "").strip()
     if not base_url or not api_key:
         fail(f"Config incomplete: {CONFIG_PATH}")
-    return {"base_url": base_url, "api_key": api_key, "model": model}
+    return {
+        "raw_base_url": raw_base_url,
+        "base_url": base_url,
+        "responses_base_url": responses_endpoint(raw_base_url),
+        "api_key": api_key,
+        "model": model,
+        "responses_model": responses_model,
+    }
 
 
 def save_config(base_url, api_key, model):
@@ -61,9 +84,18 @@ def save_config(base_url, api_key, model):
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(CONFIG_PATH, 0o600)
     print(f"Saved config: {CONFIG_PATH}")
-    print(f"Base URL: {normalize_base_url(payload['base_url'])}")
+    print(f"Images Base URL: {normalize_base_url(payload['base_url'])}")
+    print(f"Responses URL: {responses_endpoint(payload['base_url'])}")
     print(f"API Key: {mask_key(payload['api_key'])}")
     print(f"Model: {payload['model']}")
+
+
+def effective_responses_model(cfg, override_model=None):
+    if override_model:
+        return override_model
+    if cfg.get("responses_model"):
+        return cfg["responses_model"]
+    return cfg["model"]
 
 
 def error_text(resp):
@@ -77,6 +109,12 @@ def error_text(resp):
     err = payload.get("error")
     if isinstance(err, dict) and err.get("message"):
         return err["message"]
+    msg = payload.get("msg")
+    if isinstance(msg, str) and msg.strip():
+        return msg
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail
     return resp.text[:1000]
 
 
@@ -87,7 +125,7 @@ def request_models(base_url, api_key, timeout):
         timeout=timeout,
     )
     if resp.status_code != 200:
-        fail(f"HTTP {resp.status_code}: {error_text(resp)}")
+        return resp
     try:
         payload = resp.json()
     except json.JSONDecodeError:
@@ -123,6 +161,67 @@ def extract_image_bytes(payload, api_key, timeout):
     fail("No image data returned")
 
 
+def extract_image_bytes_from_responses(payload):
+    stack = [payload]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if item.get("type") == "image_generation_call":
+                for key in ("result", "b64_json", "base64", "image_b64"):
+                    value = item.get(key)
+                    if value:
+                        return base64.b64decode(value)
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    fail("No image data returned from responses endpoint")
+
+
+def should_fallback_to_responses(resp):
+    if resp.status_code != 404:
+        return False
+    body = resp.text or ""
+    markers = ("Not Found", "Page not found", "接口不存在")
+    return any(marker in body for marker in markers)
+
+
+def encode_image_data_url(image_path):
+    path = Path(image_path).expanduser()
+    if not path.is_file():
+        fail(f"Reference image not found: {path}")
+    mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    raw = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{raw}"
+
+
+def generate_with_responses(cfg, args, timeout):
+    model = effective_responses_model(cfg, args.model)
+    content = [{"type": "input_text", "text": args.prompt}]
+    if args.image:
+        content.append({"type": "input_image", "image_url": encode_image_data_url(args.image)})
+    responses_payload = {
+        "model": model,
+        "input": [{"role": "user", "content": content}],
+        "tools": [{"type": "image_generation"}],
+    }
+    resp = requests.post(
+        cfg["responses_base_url"],
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
+        json=responses_payload,
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        fail(f"HTTP {resp.status_code}: {error_text(resp)}")
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        fail(f"Non-JSON response: {resp.text[:500]}")
+    return extract_image_bytes_from_responses(payload), model
+
+
 def infer_format(out_path, fmt):
     if fmt:
         return fmt
@@ -138,11 +237,37 @@ def command_config(args):
 
 def command_test(args):
     cfg = load_config()
-    models = request_models(cfg["base_url"], cfg["api_key"], args.timeout)
-    ids = [m.get("id", "") for m in models if isinstance(m, dict)]
     print(f"Config: {CONFIG_PATH}")
     print(f"Base URL: {cfg['base_url']}")
+    print(f"Responses URL: {cfg['responses_base_url']}")
     print(f"API Key: {mask_key(cfg['api_key'])}")
+
+    models = request_models(cfg["base_url"], cfg["api_key"], args.timeout)
+    if isinstance(models, requests.Response):
+        probe = requests.post(
+            cfg["responses_base_url"],
+            headers={
+                "Authorization": f"Bearer {cfg['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": effective_responses_model(cfg),
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+                "tools": [{"type": "image_generation"}],
+            },
+            timeout=args.timeout,
+        )
+        if probe.status_code == 200:
+            print("Responses gateway OK")
+            return
+        probe_text = probe.text or ""
+        if probe.status_code == 400 and ("模型" in probe_text or "model" in probe_text.lower()):
+            print("Responses gateway reachable, but the configured default model is not accepted there.")
+            print("The standard v1 image path remains the default. Responses fallback may need --model override.")
+            return
+        fail(f"HTTP {probe.status_code}: {error_text(probe)}")
+
+    ids = [m.get("id", "") for m in models if isinstance(m, dict)]
     print("Models:")
     for model_id in ids:
         print(f"- {model_id}")
@@ -167,6 +292,8 @@ def command_generate(args):
     if output_format in {"jpeg", "webp"}:
         payload["output_compression"] = args.compression
 
+    used_mode = "generate"
+    used_model = model
     if args.image:
         image_path = Path(args.image).expanduser()
         if not image_path.is_file():
@@ -180,6 +307,7 @@ def command_generate(args):
                 files={"image": (image_path.name, image_file, mime_type)},
                 timeout=args.timeout,
             )
+        used_mode = "edit"
     else:
         resp = requests.post(
             f"{cfg['base_url']}/images/generations",
@@ -190,20 +318,24 @@ def command_generate(args):
             json=payload,
             timeout=args.timeout,
         )
-    if resp.status_code != 200:
+
+    if resp.status_code == 200:
+        try:
+            response_payload = resp.json()
+        except json.JSONDecodeError:
+            fail(f"Non-JSON response: {resp.text[:500]}")
+        raw = extract_image_bytes(response_payload, cfg["api_key"], args.timeout)
+    elif should_fallback_to_responses(resp):
+        raw, used_model = generate_with_responses(cfg, args, args.timeout)
+        used_mode = "responses-edit" if args.image else "responses"
+    else:
         fail(f"HTTP {resp.status_code}: {error_text(resp)}")
 
-    try:
-        response_payload = resp.json()
-    except json.JSONDecodeError:
-        fail(f"Non-JSON response: {resp.text[:500]}")
-
-    raw = extract_image_bytes(response_payload, cfg["api_key"], args.timeout)
     out_path.write_bytes(raw)
     print(f"Saved image: {out_path}")
     print(f"Bytes: {len(raw)}")
-    print(f"Model: {model}")
-    print(f"Mode: {'edit' if args.image else 'generate'}")
+    print(f"Model: {used_model}")
+    print(f"Mode: {used_mode}")
 
 
 def build_parser():
