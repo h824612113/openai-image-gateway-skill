@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -231,6 +232,13 @@ def infer_format(out_path, fmt):
     return "png"
 
 
+def default_output_path(fmt):
+    output_format = fmt or "png"
+    output_dir = Path.cwd() / "generated"
+    filename = f"image-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{output_format}"
+    return output_dir / filename
+
+
 def command_config(args):
     save_config(args.base, args.key, args.model)
 
@@ -275,7 +283,7 @@ def command_test(args):
 
 def command_generate(args):
     cfg = load_config()
-    out_path = Path(args.out).expanduser()
+    out_path = Path(args.out).expanduser() if args.out else default_output_path(args.format)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     output_format = infer_format(str(out_path), args.format)
@@ -354,7 +362,7 @@ def build_parser():
 
     gen_parser = sub.add_parser("generate", help="Generate an image to a target path")
     gen_parser.add_argument("--prompt", required=True, help="Prompt text")
-    gen_parser.add_argument("--out", required=True, help="Target file path")
+    gen_parser.add_argument("--out", help="Target file path; defaults to ./generated/image-YYYYMMDD-HHMMSS.<format>")
     gen_parser.add_argument("--image", help="Reference image path for edit mode")
     gen_parser.add_argument("--size", default="1024x1024", help="Image size or auto")
     gen_parser.add_argument("--quality", default="auto", choices=["auto", "low", "medium", "high"])
