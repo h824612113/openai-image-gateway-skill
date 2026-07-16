@@ -2,5 +2,6 @@
   "base_url": "https://example.com/",
   "api_key": "PUT_YOUR_KEY_HERE",
   "model": "gpt-image-2",
+  "endpoint_mode": "auto",
   "responses_model": "gpt-image"
 }

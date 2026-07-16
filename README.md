@@ -11,7 +11,7 @@ This repository publishes one standalone skill:
 The skill lets a user:
 
 - save `base_url`, `api_key`, and default `model` once
-- test connectivity through `/v1/models`
+- safely select and cache a usable image endpoint before generation
 - generate an image from text and save it to a local file path
 - generate a new image from a reference image and prompt
 
@@ -81,6 +81,10 @@ After install and config, users can invoke it in Codex with prompts like:
 
 - Python 3
 - `requests`
+
+## Endpoint Cache
+
+The selected endpoint is cached with a SHA-256 fingerprint of the configured base URL and API key. Reusing the same configuration skips probing; changing either value safely reselects the endpoint before the next generation. Existing caches are upgraded after one safe probe.
 
 ## Security
 

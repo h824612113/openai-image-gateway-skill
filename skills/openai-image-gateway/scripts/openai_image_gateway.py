@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -14,6 +15,7 @@ import requests
 SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_DIR / "local_config.json"
 DEFAULT_MODEL = "gpt-image-2"
+ENDPOINT_MODES = ("auto", "images", "responses")
 
 
 def fail(message):
@@ -50,6 +52,11 @@ def mask_key(key):
     return f"{key[:6]}...{key[-4:]}"
 
 
+def endpoint_fingerprint(raw_base_url, api_key):
+    value = f"{normalize_base_url(raw_base_url)}\0{api_key}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
 def load_config():
     if not CONFIG_PATH.exists():
         fail(f"Config not found: {CONFIG_PATH}")
@@ -64,8 +71,13 @@ def load_config():
     api_key = (data.get("api_key", "") or "").strip()
     model = (data.get("model", "") or DEFAULT_MODEL).strip()
     responses_model = (data.get("responses_model", "") or "").strip()
+    endpoint_mode = (data.get("endpoint_mode", "auto") or "auto").strip().lower()
+    cached_fingerprint = (data.get("endpoint_mode_fingerprint", "") or "").strip()
     if not base_url or not api_key:
         fail(f"Config incomplete: {CONFIG_PATH}")
+    if endpoint_mode not in ENDPOINT_MODES:
+        fail(f"Invalid endpoint_mode in {CONFIG_PATH}: {endpoint_mode}")
+    current_fingerprint = endpoint_fingerprint(raw_base_url, api_key)
     return {
         "raw_base_url": raw_base_url,
         "base_url": base_url,
@@ -73,15 +85,35 @@ def load_config():
         "api_key": api_key,
         "model": model,
         "responses_model": responses_model,
+        "endpoint_mode": endpoint_mode,
+        "endpoint_mode_is_current": cached_fingerprint == current_fingerprint,
+        "endpoint_fingerprint": current_fingerprint,
     }
 
 
-def save_config(base_url, api_key, model):
+def save_config(base_url, api_key, model, endpoint_mode):
+    existing = {}
+    if CONFIG_PATH.exists():
+        try:
+            existing = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            pass
+    fingerprint = endpoint_fingerprint(base_url, api_key)
+    cached_mode = (existing.get("endpoint_mode", "") or "").strip().lower()
+    cached_fingerprint = (existing.get("endpoint_mode_fingerprint", "") or "").strip()
+    if endpoint_mode == "auto" and cached_mode in ("images", "responses") and cached_fingerprint == fingerprint:
+        endpoint_mode = cached_mode
+
     payload = {
         "base_url": base_url.strip(),
         "api_key": api_key.strip(),
         "model": (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        "endpoint_mode": endpoint_mode,
     }
+    if endpoint_mode in ("images", "responses"):
+        payload["endpoint_mode_fingerprint"] = fingerprint
+    if existing.get("responses_model"):
+        payload["responses_model"] = existing["responses_model"]
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(CONFIG_PATH, 0o600)
     print(f"Saved config: {CONFIG_PATH}")
@@ -89,6 +121,15 @@ def save_config(base_url, api_key, model):
     print(f"Responses URL: {responses_endpoint(payload['base_url'])}")
     print(f"API Key: {mask_key(payload['api_key'])}")
     print(f"Model: {payload['model']}")
+    print(f"Endpoint mode: {payload['endpoint_mode']}")
+
+
+def save_endpoint_mode(endpoint_mode, fingerprint):
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    data["endpoint_mode"] = endpoint_mode
+    data["endpoint_mode_fingerprint"] = fingerprint
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 def effective_responses_model(cfg, override_model=None):
@@ -117,24 +158,6 @@ def error_text(resp):
     if isinstance(detail, str) and detail.strip():
         return detail
     return resp.text[:1000]
-
-
-def request_models(base_url, api_key, timeout):
-    resp = requests.get(
-        f"{base_url}/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=timeout,
-    )
-    if resp.status_code != 200:
-        return resp
-    try:
-        payload = resp.json()
-    except json.JSONDecodeError:
-        fail(f"Non-JSON response: {resp.text[:500]}")
-    data = payload.get("data")
-    if not isinstance(data, list):
-        fail(f"Unexpected models payload: {payload}")
-    return data
 
 
 def extract_image_bytes(payload, api_key, timeout):
@@ -178,12 +201,50 @@ def extract_image_bytes_from_responses(payload):
     fail("No image data returned from responses endpoint")
 
 
-def should_fallback_to_responses(resp):
-    if resp.status_code != 404:
-        return False
-    body = resp.text or ""
-    markers = ("Not Found", "Page not found", "接口不存在")
-    return any(marker in body for marker in markers)
+def preferred_endpoint_modes(cfg):
+    if cfg["raw_base_url"].endswith("/responses"):
+        return ("responses", "images")
+    return ("images", "responses")
+
+
+def probe_endpoint(cfg, endpoint_mode, timeout):
+    url = (
+        f"{cfg['base_url']}/images/generations"
+        if endpoint_mode == "images"
+        else cfg["responses_base_url"]
+    )
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {cfg['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return False, str(exc)
+
+    return response.status_code in (200, 400, 422), str(response.status_code)
+
+
+def select_endpoint_mode(cfg, timeout):
+    results = []
+    preferred = preferred_endpoint_modes(cfg)
+    if cfg["endpoint_mode_is_current"] and cfg["endpoint_mode"] in ("images", "responses"):
+        preferred = (cfg["endpoint_mode"],) + tuple(
+            mode for mode in preferred if mode != cfg["endpoint_mode"]
+        )
+
+    for endpoint_mode in preferred:
+        available, detail = probe_endpoint(cfg, endpoint_mode, timeout)
+        results.append(f"{endpoint_mode}={detail}")
+        if available:
+            save_endpoint_mode(endpoint_mode, cfg["endpoint_fingerprint"])
+            return endpoint_mode, results
+
+    fail("No usable image endpoint found (" + ", ".join(results) + ")")
 
 
 def encode_image_data_url(image_path):
@@ -240,7 +301,7 @@ def default_output_path(fmt):
 
 
 def command_config(args):
-    save_config(args.base, args.key, args.model)
+    save_config(args.base, args.key, args.model, args.endpoint_mode)
 
 
 def command_test(args):
@@ -249,36 +310,9 @@ def command_test(args):
     print(f"Base URL: {cfg['base_url']}")
     print(f"Responses URL: {cfg['responses_base_url']}")
     print(f"API Key: {mask_key(cfg['api_key'])}")
-
-    models = request_models(cfg["base_url"], cfg["api_key"], args.timeout)
-    if isinstance(models, requests.Response):
-        probe = requests.post(
-            cfg["responses_base_url"],
-            headers={
-                "Authorization": f"Bearer {cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": effective_responses_model(cfg),
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
-                "tools": [{"type": "image_generation"}],
-            },
-            timeout=args.timeout,
-        )
-        if probe.status_code == 200:
-            print("Responses gateway OK")
-            return
-        probe_text = probe.text or ""
-        if probe.status_code == 400 and ("模型" in probe_text or "model" in probe_text.lower()):
-            print("Responses gateway reachable, but the configured default model is not accepted there.")
-            print("The standard v1 image path remains the default. Responses fallback may need --model override.")
-            return
-        fail(f"HTTP {probe.status_code}: {error_text(probe)}")
-
-    ids = [m.get("id", "") for m in models if isinstance(m, dict)]
-    print("Models:")
-    for model_id in ids:
-        print(f"- {model_id}")
+    endpoint_mode, results = select_endpoint_mode(cfg, args.timeout)
+    print(f"Selected endpoint mode: {endpoint_mode}")
+    print(f"Safe probes: {', '.join(results)}")
 
 
 def command_generate(args):
@@ -300,9 +334,14 @@ def command_generate(args):
     if output_format in {"jpeg", "webp"}:
         payload["output_compression"] = args.compression
 
-    used_mode = "generate"
-    used_model = model
-    if args.image:
+    endpoint_mode = cfg["endpoint_mode"] if cfg["endpoint_mode_is_current"] else "auto"
+    if endpoint_mode == "auto":
+        endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout)
+
+    if endpoint_mode == "responses":
+        raw, used_model = generate_with_responses(cfg, args, args.timeout)
+        used_mode = "responses-edit" if args.image else "responses"
+    elif args.image:
         image_path = Path(args.image).expanduser()
         if not image_path.is_file():
             fail(f"Reference image not found: {image_path}")
@@ -316,6 +355,14 @@ def command_generate(args):
                 timeout=args.timeout,
             )
         used_mode = "edit"
+        used_model = model
+        if resp.status_code != 200:
+            fail(f"HTTP {resp.status_code}: {error_text(resp)}")
+        try:
+            response_payload = resp.json()
+        except json.JSONDecodeError:
+            fail(f"Non-JSON response: {resp.text[:500]}")
+        raw = extract_image_bytes(response_payload, cfg["api_key"], args.timeout)
     else:
         resp = requests.post(
             f"{cfg['base_url']}/images/generations",
@@ -326,18 +373,15 @@ def command_generate(args):
             json=payload,
             timeout=args.timeout,
         )
-
-    if resp.status_code == 200:
+        used_mode = "generate"
+        used_model = model
+        if resp.status_code != 200:
+            fail(f"HTTP {resp.status_code}: {error_text(resp)}")
         try:
             response_payload = resp.json()
         except json.JSONDecodeError:
             fail(f"Non-JSON response: {resp.text[:500]}")
         raw = extract_image_bytes(response_payload, cfg["api_key"], args.timeout)
-    elif should_fallback_to_responses(resp):
-        raw, used_model = generate_with_responses(cfg, args, args.timeout)
-        used_mode = "responses-edit" if args.image else "responses"
-    else:
-        fail(f"HTTP {resp.status_code}: {error_text(resp)}")
 
     out_path.write_bytes(raw)
     print(f"Saved image: {out_path}")
@@ -354,9 +398,15 @@ def build_parser():
     config_parser.add_argument("--base", required=True, help="Gateway base URL, with or without /v1")
     config_parser.add_argument("--key", required=True, help="API key")
     config_parser.add_argument("--model", default=DEFAULT_MODEL, help="Default model")
+    config_parser.add_argument(
+        "--endpoint-mode",
+        choices=ENDPOINT_MODES,
+        default="auto",
+        help="Use images or responses directly, or auto-detect once during generation.",
+    )
     config_parser.set_defaults(func=command_config)
 
-    test_parser = sub.add_parser("test", help="Test connectivity via /models")
+    test_parser = sub.add_parser("test", help="Safely detect and save the usable image endpoint")
     test_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
     test_parser.set_defaults(func=command_test)
 
@@ -378,7 +428,12 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except requests.Timeout:
+        fail("Request timed out. The gateway may have completed generation; do not retry automatically.")
+    except requests.RequestException as exc:
+        fail(f"Network request failed: {exc}")
 
 
 if __name__ == "__main__":

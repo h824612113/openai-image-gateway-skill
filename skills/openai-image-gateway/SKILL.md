@@ -10,7 +10,7 @@ Use this skill when the user wants a reusable local image-generation workflow ba
 ## What this skill does
 
 - Stores `base_url`, `api_key`, and default `model` once in a local config file
-- Tests gateway connectivity by querying `/v1/models`
+- Safely selects and caches the usable image endpoint without invoking image generation
 - Generates an image from text and saves it to a user-specified local path
 - Generates a new image from a reference image and prompt
 
@@ -76,7 +76,7 @@ Optional generation overrides:
 ## Workflow
 
 1. If `local_config.json` is missing or incomplete, run `config`.
-2. Run `test` when the user asks to verify the gateway.
+2. Run `test` to safely select and cache the usable image endpoint.
 3. Run `generate` when the user gives a prompt and target path.
 4. Add `--image /path/to/reference.png` when the user wants to use a reference image.
 5. If generation fails, report the upstream error or timeout directly.
@@ -85,4 +85,8 @@ Optional generation overrides:
 
 - The script normalizes `base_url` so both `https://host` and `https://host/v1` work.
 - The script supports both `b64_json` responses and URL-based image responses.
-- The script uses `/images/generations` for text-only prompts and `/images/edits` when `--image` is provided.
+- `test` sends an empty request without a prompt, model, or image-generation tool, so it cannot initiate image generation.
+- The selected endpoint is saved as `endpoint_mode`; later `generate` calls use only that endpoint and do not fall back by issuing a second generation request.
+- Use `endpoint_mode: "images"` or `endpoint_mode: "responses"` to choose an endpoint manually, or `"auto"` to select one safely on the next command.
+- The cache is bound to a SHA-256 fingerprint of the configured base URL and API key. Changing either safely reselects an endpoint; unchanged settings reuse the cached endpoint.
+- Existing caches without a fingerprint are safely reselected once, then upgraded automatically.
