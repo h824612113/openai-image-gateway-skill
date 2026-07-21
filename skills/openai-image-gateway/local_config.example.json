@@ -1,7 +1,13 @@
 {
   "base_url": "https://example.com/",
   "api_key": "PUT_YOUR_KEY_HERE",
-  "model": "gpt-image-2",
+  "model": "auto",
   "endpoint_mode": "auto",
-  "responses_model": "gpt-image"
+  "responses_model": "",
+  "model_candidates": [
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image"
+  ]
 }

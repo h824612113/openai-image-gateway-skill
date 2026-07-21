@@ -11,6 +11,7 @@ This repository publishes one standalone skill:
 The skill lets a user:
 
 - save `base_url`, `api_key`, and default `model` once
+- resolve and cache a usable image model when the provider exposes model aliases or fallback versions
 - safely select and cache a usable image endpoint before generation
 - generate an image from text and save it to a local file path
 - generate a new image from a reference image and prompt
@@ -38,9 +39,10 @@ Users must provide their own gateway URL and API key. No real credentials are in
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py config \
   --base 'YOUR_URL' \
-  --key 'YOUR_KEY' \
-  --model gpt-image-2
+  --model auto
 ```
+
+Omit `--key` to enter the key through a hidden terminal prompt. On the first generation, the skill checks the provider model list when available, then tries `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image` only when the previous model was explicitly rejected. The first accepted model is cached for later calls.
 
 Test connectivity:
 
@@ -76,6 +78,8 @@ After install and config, users can invoke it in Codex with prompts like:
 - `用 openai-image-gateway 生图，保存到 /path/to/file.png`
 - `用图片网关生图，输出到 /path/to/file.png`
 - `用 openai-image-gateway 测一下连接`
+
+If all candidates are rejected, the skill reports the endpoint and attempted model IDs and asks the provider for the exact image-generation model. It never retries after a timeout or server error because the previous request may already have started generation.
 
 ## Requirements
 
