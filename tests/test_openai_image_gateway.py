@@ -319,5 +319,229 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(cfg["model_cache_is_current"])
 
 
+class StreamingResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, events):
+        self._events = events
+
+    def iter_lines(self, decode_unicode=False):
+        for event in self._events:
+            yield "data: " + json.dumps(event)
+
+    def json(self):
+        raise AssertionError("a streaming response must be parsed as SSE, not JSON")
+
+
+def completed_event(image_bytes):
+    return {
+        "type": "response.completed",
+        "response": {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            ]
+        },
+    }
+
+
+class StreamingTests(unittest.TestCase):
+    def _generate(self, response, **arg_overrides):
+        cfg = make_config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", return_value=response) as post,
+            ):
+                raw, model = gateway.generate_with_responses(
+                    cfg,
+                    make_args(stream=True, background=False, **arg_overrides),
+                    timeout=30,
+                    output_format="png",
+                )
+        return raw, model, post
+
+    def test_saves_only_the_final_image_from_a_stream(self):
+        response = StreamingResponse(
+            [
+                {
+                    "type": "response.image_generation_call.partial_image",
+                    "partial_image_b64": base64.b64encode(b"preview").decode("ascii"),
+                },
+                completed_event(b"final-image"),
+            ]
+        )
+
+        raw, _, post = self._generate(response)
+
+        self.assertEqual(raw, b"final-image")
+        self.assertTrue(post.call_args.kwargs["stream"])
+        payload = post.call_args.kwargs["json"]
+        self.assertTrue(payload["stream"])
+        self.assertEqual(
+            payload["tools"][0]["partial_images"], gateway.PARTIAL_IMAGE_COUNT
+        )
+
+    def test_truncated_stream_fails_instead_of_saving_a_partial_preview(self):
+        response = StreamingResponse(
+            [
+                {
+                    "type": "response.image_generation_call.partial_image",
+                    "partial_image_b64": base64.b64encode(b"preview").decode("ascii"),
+                }
+            ]
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self._generate(response)
+
+        self.assertIn("partial previews were discarded", stderr.getvalue())
+
+    def test_stream_failure_event_reports_the_upstream_message(self):
+        response = StreamingResponse(
+            [{"type": "error", "error": {"message": "content policy violation"}}]
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self._generate(response)
+
+        self.assertIn("content policy violation", stderr.getvalue())
+
+    def test_streaming_is_not_requested_by_default(self):
+        cfg = make_config()
+        response = FakeResponse(200, completed_event(b"image")["response"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", return_value=response) as post,
+            ):
+                gateway.generate_with_responses(
+                    cfg, make_args(), timeout=30, output_format="png"
+                )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("stream", payload)
+        self.assertNotIn("background", payload)
+        self.assertNotIn("partial_images", payload["tools"][0])
+        self.assertFalse(post.call_args.kwargs["stream"])
+
+
+class BackgroundTests(unittest.TestCase):
+    def test_polls_until_the_background_response_completes(self):
+        cfg = make_config()
+        queued = FakeResponse(200, {"id": "resp_1", "status": "queued", "output": []})
+        done = FakeResponse(
+            200, dict(completed_event(b"background-image")["response"], status="completed")
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", return_value=queued) as post,
+                mock.patch.object(gateway.requests, "get", return_value=done) as get,
+                mock.patch.object(gateway.time, "sleep") as sleep,
+            ):
+                raw, _ = gateway.generate_with_responses(
+                    cfg,
+                    make_args(background=True, stream=False),
+                    timeout=30,
+                    output_format="png",
+                )
+
+        self.assertEqual(raw, b"background-image")
+        self.assertTrue(post.call_args.kwargs["json"]["background"])
+        self.assertEqual(
+            get.call_args.args[0], "https://gateway.example/responses/resp_1"
+        )
+        sleep.assert_called_once_with(gateway.BACKGROUND_POLL_SECONDS)
+
+    def test_failed_background_response_reports_the_upstream_message(self):
+        cfg = make_config()
+        queued = FakeResponse(200, {"id": "resp_1", "status": "in_progress"})
+        failed = FakeResponse(
+            200,
+            {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {"message": "generation rejected upstream"},
+            },
+        )
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", return_value=queued),
+                mock.patch.object(gateway.requests, "get", return_value=failed),
+                mock.patch.object(gateway.time, "sleep"),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit),
+            ):
+                gateway.generate_with_responses(
+                    cfg,
+                    make_args(background=True, stream=False),
+                    timeout=30,
+                    output_format="png",
+                )
+
+        self.assertIn("generation rejected upstream", stderr.getvalue())
+
+    def test_background_polling_stops_at_the_timeout_budget(self):
+        cfg = make_config()
+        stuck = FakeResponse(200, {"id": "resp_1", "status": "in_progress"})
+        clock = iter([0.0, 0.0, 5.0, 100.0, 100.0])
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(gateway.requests, "get", return_value=stuck),
+            mock.patch.object(gateway.time, "sleep"),
+            mock.patch.object(gateway.time, "monotonic", lambda: next(clock)),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            gateway.await_background_response(
+                cfg, {"id": "resp_1", "status": "in_progress"}, {}, timeout=30
+            )
+
+        self.assertIn("still in_progress after 30s", stderr.getvalue())
+
+    def test_responses_only_flags_are_rejected_on_the_images_endpoint(self):
+        parser = gateway.build_parser()
+        args = parser.parse_args(
+            ["generate", "--prompt", "a cat", "--out", "/tmp/cat.png", "--stream"]
+        )
+
+        cfg = dict(make_config(), endpoint_mode="images", endpoint_mode_is_current=True)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(gateway, "load_config", return_value=cfg),
+            mock.patch.object(
+                gateway, "select_endpoint_mode", return_value=("images", [])
+            ),
+            mock.patch.object(gateway, "fetch_available_models", return_value=set()),
+            mock.patch.object(gateway, "generate_with_images") as generate,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            gateway.command_generate(args)
+
+        generate.assert_not_called()
+        self.assertIn("--stream requires the responses endpoint", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

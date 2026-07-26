@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,8 @@ DEFAULT_MODEL_CANDIDATES = (
     "gpt-image",
 )
 ENDPOINT_MODES = ("auto", "images", "responses")
+BACKGROUND_POLL_SECONDS = 2
+PARTIAL_IMAGE_COUNT = 3
 MODEL_REJECTION_CODES = {"invalid_model", "model_not_found", "unsupported_model"}
 MODEL_REJECTION_PHRASES = (
     "unsupported model",
@@ -331,6 +334,75 @@ def extract_image_bytes_from_responses(payload):
     fail("No image data returned from responses endpoint")
 
 
+def extract_image_bytes_from_stream(resp):
+    saw_partial = False
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if data == "[DONE]":
+            break
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type == "response.image_generation_call.partial_image":
+            # Partial previews are never written to disk; only the final image counts.
+            saw_partial = True
+        elif event_type == "response.completed":
+            return extract_image_bytes_from_responses(event.get("response", {}))
+        elif event_type in {"response.failed", "error"}:
+            fail(f"Streaming generation failed: {error_event_text(event)}")
+
+    if saw_partial:
+        fail("Streaming ended before the final image; partial previews were discarded")
+    fail("No image data returned from streaming responses endpoint")
+
+
+def error_event_text(event):
+    for holder in (event, event.get("response") or {}):
+        if not isinstance(holder, dict):
+            continue
+        error = holder.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return error["message"]
+        if isinstance(error, str) and error.strip():
+            return error
+    return json.dumps(event, ensure_ascii=False)[:500]
+
+
+def await_background_response(cfg, payload, headers, timeout):
+    # Bound the wait so a stuck job cannot poll forever; report instead of retrying.
+    deadline = time.monotonic() + max(timeout, BACKGROUND_POLL_SECONDS)
+    while payload.get("status") in {"queued", "in_progress"}:
+        response_id = payload.get("id")
+        if not response_id:
+            fail(f"Background response is missing an id: {payload}")
+        if time.monotonic() >= deadline:
+            fail(
+                f"Background generation still {payload['status']} after {timeout}s "
+                f"(id {response_id}). It may still finish upstream; do not retry blindly."
+            )
+        time.sleep(BACKGROUND_POLL_SECONDS)
+        resp = requests.get(
+            f"{cfg['responses_base_url']}/{response_id}",
+            headers=headers,
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            fail(f"Background poll HTTP {resp.status_code}: {error_text(resp)}")
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError:
+            fail(f"Non-JSON background response: {resp.text[:500]}")
+
+    status = payload.get("status")
+    if status in {"failed", "cancelled", "incomplete"}:
+        fail(f"Background generation {status}: {error_event_text(payload)}")
+    return payload
+
+
 def preferred_endpoint_modes(cfg):
     if cfg["raw_base_url"].endswith("/responses"):
         return ("responses", "images")
@@ -395,6 +467,8 @@ def image_generation_tool(args, output_format):
     tool["output_format"] = output_format
     if output_format in {"jpeg", "webp"}:
         tool["output_compression"] = args.compression
+    if getattr(args, "stream", False):
+        tool["partial_images"] = PARTIAL_IMAGE_COUNT
     return tool
 
 
@@ -403,6 +477,13 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
     if args.image:
         content.append({"type": "input_image", "image_url": encode_image_data_url(args.image)})
 
+    stream = getattr(args, "stream", False)
+    background = getattr(args, "background", False)
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+
     candidates = model_candidates(cfg, "responses", args.model, available_models)
     for model in candidates:
         responses_payload = {
@@ -410,20 +491,27 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
             "input": [{"role": "user", "content": content}],
             "tools": [image_generation_tool(args, output_format)],
         }
+        if background:
+            responses_payload["background"] = True
+        if stream:
+            responses_payload["stream"] = True
         resp = requests.post(
             cfg["responses_base_url"],
-            headers={
-                "Authorization": f"Bearer {cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json=responses_payload,
             timeout=timeout,
+            stream=stream,
         )
         if resp.status_code == 200:
+            if stream:
+                raw = extract_image_bytes_from_stream(resp)
+                save_resolved_model(cfg, "responses", model)
+                return raw, model
             try:
                 payload = resp.json()
             except json.JSONDecodeError:
                 fail(f"Non-JSON response: {resp.text[:500]}")
+            payload = await_background_response(cfg, payload, headers, timeout)
             raw = extract_image_bytes_from_responses(payload)
             save_resolved_model(cfg, "responses", model)
             return raw, model
@@ -542,6 +630,12 @@ def command_generate(args):
     if endpoint_mode == "auto":
         endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout)
 
+    # --background and --stream are Responses-only; reject them before any generation request.
+    if endpoint_mode != "responses":
+        for flag in ("background", "stream"):
+            if getattr(args, flag, False):
+                fail(f"--{flag} requires the responses endpoint, but images was selected")
+
     available_models = set()
     if not cfg.get("model_cache_is_current"):
         available_models = fetch_available_models(cfg, args.timeout)
@@ -592,6 +686,16 @@ def build_parser():
     gen_parser.add_argument("--format", choices=["png", "jpeg", "webp"], help="Output format")
     gen_parser.add_argument("--compression", type=int, default=100, help="Compression for jpeg/webp")
     gen_parser.add_argument("--model", help="Override model")
+    gen_parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Run responses-endpoint generation asynchronously and poll until it completes.",
+    )
+    gen_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream responses-endpoint events and save only the final image.",
+    )
     gen_parser.add_argument("--timeout", type=int, default=120, help="HTTP timeout in seconds")
     gen_parser.set_defaults(func=command_generate)
 

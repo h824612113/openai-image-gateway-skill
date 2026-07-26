@@ -74,6 +74,8 @@ Optional generation overrides:
 - `--compression 0-100`
 - `--model MODEL_NAME`
 - `--timeout SECONDS`
+- `--background` (responses endpoint only; poll a long generation instead of holding the request open)
+- `--stream` (responses endpoint only; stream progress and save only the final image)
 
 ## Workflow
 
@@ -95,3 +97,5 @@ Optional generation overrides:
 - Use `endpoint_mode: "images"` or `endpoint_mode: "responses"` to choose an endpoint manually, or `"auto"` to select one safely on the next command.
 - The cache is bound to a SHA-256 fingerprint of the configured base URL and API key. Changing either safely reselects an endpoint; unchanged settings reuse the cached endpoint.
 - Existing caches without a fingerprint are safely reselected once, then upgraded automatically.
+- `--background` and `--stream` work only on the responses endpoint; on the images endpoint the script rejects them before sending any request.
+- Partial preview images from `--stream` are never written to disk. If a stream ends before the final image, the script fails instead of saving an unfinished picture.

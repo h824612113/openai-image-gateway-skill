@@ -67,6 +67,17 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py ge
   --out ~/Downloads/product.png
 ```
 
+Long generations on the responses endpoint:
+
+```bash
+python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --prompt "a highly detailed illustrated map" \
+  --out ~/Downloads/map.png \
+  --background
+```
+
+`--background` polls until the response completes instead of holding one long request open. `--stream` follows progress events and saves only the final image; partial previews are discarded rather than written to disk. Both flags require the responses endpoint and are rejected before any request when the images endpoint is selected.
+
 ## Natural language usage
 
 After install and config, users can invoke it in Codex with prompts like:
