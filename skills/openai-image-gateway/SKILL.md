@@ -10,8 +10,10 @@ Use this skill when the user wants a reusable local image-generation workflow ba
 ## What this skill does
 
 - Stores `base_url`, `api_key`, and default `model` once in a local config file
+- Keeps Images and Responses model preferences separate
 - Resolves a usable model from the provider model list or conservative image-model candidates
-- Safely selects and caches the usable image endpoint without invoking image generation
+- Diagnoses endpoint reachability without changing explicit endpoint choices
+- Records `last_successful_mode` only after a real image is returned
 - Generates an image from text and saves it to a user-specified local path
 - Generates a new image from a reference image and prompt
 
@@ -46,16 +48,26 @@ First-time config:
 ```bash
 python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py config \
   --base https://example.com/ \
-  --model auto
+  --model gpt-image-2 \
+  --responses-model gpt-5.4 \
+  --endpoint-mode images
 ```
 
-Omit `--key` to enter it through a hidden terminal prompt. The first generation resolves a model in this order: configured model, cached model, provider `/models` results, then `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image`.
+Omit `--key` to enter it through a hidden terminal prompt. Use `endpoint_mode: images|responses` for an operator override. Use `auto` only when automatic diagnostic selection is wanted.
 
 Connectivity test:
 
 ```bash
 python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py test
 ```
+
+`test` is read-only by default. It reports reachability and never changes `endpoint_mode`. To convert `auto` into the first reachable diagnostic candidate, opt in explicitly:
+
+```bash
+python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py test --select
+```
+
+`--select` never overrides an explicit `images` or `responses` setting. A diagnostic selection is not proof that image generation works.
 
 Generate to a target path:
 
@@ -79,23 +91,27 @@ Optional generation overrides:
 
 ## Workflow
 
-1. If `local_config.json` is missing or incomplete, run `config`.
-2. Run `test` to safely select and cache the usable image endpoint.
-3. Run `generate` when the user gives a prompt and target path. If the model is set to `auto`, the script resolves and caches the first accepted model.
-4. Add `--image /path/to/reference.png` when the user wants to use a reference image.
-5. If a provider explicitly rejects a model (`model_not_found`, `unsupported_model`, or an equivalent 400/404 response), try the next candidate. Do not retry after timeouts, rate limits, 5xx responses, or any ambiguous response because generation may already have started.
-6. If no candidate is accepted, report the endpoint, attempted models, and ask the provider for the exact image model ID.
+1. If `local_config.json` is missing or incomplete, run `config` and choose `images`, `responses`, or `auto` deliberately.
+2. Run `test` for read-only diagnostics. Treat HTTP 400/422 as endpoint reachability only, not image-generation capability.
+3. Run `generate` when the user gives a prompt and target path. Explicit endpoint modes are always honored.
+4. In `auto`, prefer a fingerprint-matched `last_successful_mode`; otherwise probe once and use one reachable candidate without caching it as successful.
+5. After real image bytes are extracted, cache `last_successful_mode` and the accepted model.
+6. Add `--image /path/to/reference.png` when the user wants to use a reference image.
+7. If a provider explicitly rejects a model (`model_not_found`, `unsupported_model`, or an equivalent 400/404 response), try the next candidate. Do not retry or switch endpoints after timeouts, rate limits, 5xx responses, or any ambiguous response because generation may already have started.
+8. If no candidate is accepted, report the endpoint and attempted models.
 
 ## Notes
 
 - The script normalizes `base_url` so both `https://host` and `https://host/v1` work.
 - The script supports both `b64_json` responses and URL-based image responses.
 - `test` sends an empty request without a prompt, model, or image-generation tool, so it cannot initiate image generation.
-- The selected endpoint is saved as `endpoint_mode`; later `generate` calls use only that endpoint and do not fall back by issuing a second generation request.
+- `test` does not write configuration unless `--select` is present, and explicit endpoint modes are immutable to testing.
+- HTTP 400/422 from a safe probe means the route exists; it never means the route can generate images.
+- `endpoint_mode` stores operator intent. `last_successful_mode` is runtime-owned evidence written only after a real generation succeeds.
+- A generation call uses one endpoint only and never falls back after HTTP 502/503 or another ambiguous failure.
 - Model discovery is read-only when `/models` is available. Model fallback only continues after a definitive model rejection; it never retries uncertain generation states.
 - The first accepted model is cached with a configuration fingerprint and reused until the base URL, API key, or endpoint mode changes.
-- Use `endpoint_mode: "images"` or `endpoint_mode: "responses"` to choose an endpoint manually, or `"auto"` to select one safely on the next command.
-- The cache is bound to a SHA-256 fingerprint of the configured base URL and API key. Changing either safely reselects an endpoint; unchanged settings reuse the cached endpoint.
-- Existing caches without a fingerprint are safely reselected once, then upgraded automatically.
+- `responses_model` is tried before the Images `model` when the Responses endpoint is selected.
+- Success caches are bound to a SHA-256 fingerprint of the configured base URL and API key.
 - `--background` and `--stream` work only on the responses endpoint; on the images endpoint the script rejects them before sending any request.
 - Partial preview images from `--stream` are never written to disk. If a stream ends before the final image, the script fails instead of saving an unfinished picture.

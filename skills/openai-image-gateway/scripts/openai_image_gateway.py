@@ -99,15 +99,24 @@ def load_config():
     model_candidates = [str(item).strip() for item in model_candidates if str(item).strip()]
     resolved_model = (data.get("resolved_model", "") or "").strip()
     endpoint_mode = (data.get("endpoint_mode", "auto") or "auto").strip().lower()
-    cached_fingerprint = (data.get("endpoint_mode_fingerprint", "") or "").strip()
     if not base_url or not api_key:
         fail(f"Config incomplete: {CONFIG_PATH}")
     if endpoint_mode not in ENDPOINT_MODES:
         fail(f"Invalid endpoint_mode in {CONFIG_PATH}: {endpoint_mode}")
     current_fingerprint = endpoint_fingerprint(raw_base_url, api_key)
+    last_successful_mode = (data.get("last_successful_mode", "") or "").strip().lower()
+    last_successful_mode_is_current = bool(
+        last_successful_mode in ("images", "responses")
+        and data.get("last_successful_mode_fingerprint", "") == current_fingerprint
+    )
     resolved_endpoint_mode = (
         data.get("resolved_endpoint_mode") or endpoint_mode
     ).strip().lower()
+    active_model_mode = (
+        endpoint_mode
+        if endpoint_mode in ("images", "responses")
+        else last_successful_mode if last_successful_mode_is_current else resolved_endpoint_mode
+    )
     current_model_fingerprint = model_fingerprint(
         raw_base_url, api_key, resolved_endpoint_mode
     )
@@ -125,16 +134,18 @@ def load_config():
         "model_cache_is_current": bool(
             resolved_model
             and data.get("model_fingerprint", "") == current_model_fingerprint
-            and resolved_endpoint_mode == endpoint_mode
-            and endpoint_mode in ("images", "responses")
+            and resolved_endpoint_mode == active_model_mode
+            and active_model_mode in ("images", "responses")
         ),
         "endpoint_mode": endpoint_mode,
-        "endpoint_mode_is_current": cached_fingerprint == current_fingerprint,
+        "endpoint_mode_is_current": endpoint_mode in ("images", "responses"),
         "endpoint_fingerprint": current_fingerprint,
+        "last_successful_mode": last_successful_mode,
+        "last_successful_mode_is_current": last_successful_mode_is_current,
     }
 
 
-def save_config(base_url, api_key, model, endpoint_mode):
+def save_config(base_url, api_key, model, responses_model, endpoint_mode):
     existing = {}
     if CONFIG_PATH.exists():
         try:
@@ -142,23 +153,21 @@ def save_config(base_url, api_key, model, endpoint_mode):
         except json.JSONDecodeError:
             pass
     fingerprint = endpoint_fingerprint(base_url, api_key)
-    cached_mode = (existing.get("endpoint_mode", "") or "").strip().lower()
-    cached_fingerprint = (existing.get("endpoint_mode_fingerprint", "") or "").strip()
-    if endpoint_mode == "auto" and cached_mode in ("images", "responses") and cached_fingerprint == fingerprint:
-        endpoint_mode = cached_mode
-
+    if responses_model is None:
+        responses_model = existing.get("responses_model", "")
     payload = {
         "base_url": base_url.strip(),
         "api_key": api_key.strip(),
         "model": (model or "auto").strip() or "auto",
+        "responses_model": (responses_model or "").strip(),
         "endpoint_mode": endpoint_mode,
     }
-    if endpoint_mode in ("images", "responses"):
-        payload["endpoint_mode_fingerprint"] = fingerprint
-    if existing.get("responses_model"):
-        payload["responses_model"] = existing["responses_model"]
     if isinstance(existing.get("model_candidates"), list):
         payload["model_candidates"] = existing["model_candidates"]
+    if existing.get("last_successful_mode_fingerprint") == fingerprint:
+        for key in ("last_successful_mode", "last_successful_mode_fingerprint"):
+            if existing.get(key):
+                payload[key] = existing[key]
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(CONFIG_PATH, 0o600)
     print(f"Saved config: {CONFIG_PATH}")
@@ -166,13 +175,22 @@ def save_config(base_url, api_key, model, endpoint_mode):
     print(f"Responses URL: {responses_endpoint(payload['base_url'])}")
     print(f"API Key: {mask_key(payload['api_key'])}")
     print(f"Model: {payload['model']}")
+    print(f"Responses model: {payload['responses_model'] or '(uses image model candidates)'}")
     print(f"Endpoint mode: {payload['endpoint_mode']}")
 
 
-def save_endpoint_mode(endpoint_mode, fingerprint):
+def save_endpoint_mode(endpoint_mode):
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     data["endpoint_mode"] = endpoint_mode
-    data["endpoint_mode_fingerprint"] = fingerprint
+    data.pop("endpoint_mode_fingerprint", None)
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def save_last_successful_mode(cfg, endpoint_mode):
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    data["last_successful_mode"] = endpoint_mode
+    data["last_successful_mode_fingerprint"] = cfg["endpoint_fingerprint"]
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(CONFIG_PATH, 0o600)
 
@@ -404,9 +422,18 @@ def await_background_response(cfg, payload, headers, timeout):
 
 
 def preferred_endpoint_modes(cfg):
-    if cfg["raw_base_url"].endswith("/responses"):
-        return ("responses", "images")
-    return ("images", "responses")
+    base_order = (
+        ("responses", "images")
+        if cfg["raw_base_url"].endswith("/responses")
+        else ("images", "responses")
+    )
+    if cfg["endpoint_mode"] in ("images", "responses"):
+        preferred = cfg["endpoint_mode"]
+    elif cfg.get("last_successful_mode_is_current"):
+        preferred = cfg["last_successful_mode"]
+    else:
+        return base_order
+    return (preferred,) + tuple(mode for mode in base_order if mode != preferred)
 
 
 def probe_endpoint(cfg, endpoint_mode, timeout):
@@ -426,27 +453,41 @@ def probe_endpoint(cfg, endpoint_mode, timeout):
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        return False, str(exc)
+        return {
+            "mode": endpoint_mode,
+            "reachable": False,
+            "detail": f"error ({exc})",
+        }
 
-    return response.status_code in (200, 400, 422), str(response.status_code)
+    reachable = response.status_code in (200, 400, 422)
+    if reachable:
+        detail = f"{response.status_code} (reachable, generation unverified)"
+    else:
+        detail = f"{response.status_code} (unreachable)"
+    return {"mode": endpoint_mode, "reachable": reachable, "detail": detail}
 
 
-def select_endpoint_mode(cfg, timeout):
-    results = []
-    preferred = preferred_endpoint_modes(cfg)
-    if cfg["endpoint_mode_is_current"] and cfg["endpoint_mode"] in ("images", "responses"):
-        preferred = (cfg["endpoint_mode"],) + tuple(
-            mode for mode in preferred if mode != cfg["endpoint_mode"]
-        )
+def probe_endpoints(cfg, timeout):
+    return [probe_endpoint(cfg, mode, timeout) for mode in preferred_endpoint_modes(cfg)]
 
-    for endpoint_mode in preferred:
-        available, detail = probe_endpoint(cfg, endpoint_mode, timeout)
-        results.append(f"{endpoint_mode}={detail}")
-        if available:
-            save_endpoint_mode(endpoint_mode, cfg["endpoint_fingerprint"])
-            return endpoint_mode, results
 
-    fail("No usable image endpoint found (" + ", ".join(results) + ")")
+def format_probe_results(probe_results):
+    return [f"{item['mode']}={item['detail']}" for item in probe_results]
+
+
+def select_endpoint_mode(cfg, timeout, probe_results=None):
+    if cfg["endpoint_mode"] in ("images", "responses"):
+        return cfg["endpoint_mode"], []
+    if cfg.get("last_successful_mode_is_current"):
+        return cfg["last_successful_mode"], []
+
+    probe_results = probe_results or probe_endpoints(cfg, timeout)
+    results = format_probe_results(probe_results)
+    for result in probe_results:
+        if result["reachable"]:
+            return result["mode"], results
+
+    fail("No reachable image endpoint found (" + ", ".join(results) + ")")
 
 
 def encode_image_data_url(image_path):
@@ -506,6 +547,7 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
             if stream:
                 raw = extract_image_bytes_from_stream(resp)
                 save_resolved_model(cfg, "responses", model)
+                save_last_successful_mode(cfg, "responses")
                 return raw, model
             try:
                 payload = resp.json()
@@ -514,6 +556,7 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
             payload = await_background_response(cfg, payload, headers, timeout)
             raw = extract_image_bytes_from_responses(payload)
             save_resolved_model(cfg, "responses", model)
+            save_last_successful_mode(cfg, "responses")
             return raw, model
         if is_model_rejection(resp):
             continue
@@ -574,6 +617,7 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                 fail(f"Non-JSON response: {resp.text[:500]}")
             raw = extract_image_bytes(response_payload, cfg["api_key"], timeout)
             save_resolved_model(cfg, "images", model)
+            save_last_successful_mode(cfg, "images")
             return raw, model, used_mode
         if is_model_rejection(resp):
             continue
@@ -606,7 +650,13 @@ def command_config(args):
     api_key = args.key or getpass.getpass("API key: ").strip()
     if not api_key:
         fail("API key is required")
-    save_config(args.base, api_key, args.model, args.endpoint_mode)
+    save_config(
+        args.base,
+        api_key,
+        args.model,
+        args.responses_model,
+        args.endpoint_mode,
+    )
 
 
 def command_test(args):
@@ -615,9 +665,18 @@ def command_test(args):
     print(f"Base URL: {cfg['base_url']}")
     print(f"Responses URL: {cfg['responses_base_url']}")
     print(f"API Key: {mask_key(cfg['api_key'])}")
-    endpoint_mode, results = select_endpoint_mode(cfg, args.timeout)
-    print(f"Selected endpoint mode: {endpoint_mode}")
-    print(f"Safe probes: {', '.join(results)}")
+    probe_results = probe_endpoints(cfg, args.timeout)
+    print(f"Safe probes: {', '.join(format_probe_results(probe_results))}")
+    if not args.select:
+        print(f"Configured endpoint mode: {cfg['endpoint_mode']} (config unchanged)")
+        return
+    if cfg["endpoint_mode"] != "auto":
+        print(f"Configured endpoint mode is explicit: {cfg['endpoint_mode']} (config unchanged)")
+        return
+
+    endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout, probe_results)
+    save_endpoint_mode(endpoint_mode)
+    print(f"Selected diagnostic endpoint: {endpoint_mode} (generation unverified)")
 
 
 def command_generate(args):
@@ -626,7 +685,7 @@ def command_generate(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     output_format = infer_format(str(out_path), args.format)
-    endpoint_mode = cfg["endpoint_mode"] if cfg["endpoint_mode_is_current"] else "auto"
+    endpoint_mode = cfg["endpoint_mode"]
     if endpoint_mode == "auto":
         endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout)
 
@@ -666,6 +725,11 @@ def build_parser():
     config_parser.add_argument("--key", help="API key; omit to enter it without echoing")
     config_parser.add_argument("--model", default="auto", help="Preferred model or auto")
     config_parser.add_argument(
+        "--responses-model",
+        default=None,
+        help="Primary Responses API model; separate from the Images API model",
+    )
+    config_parser.add_argument(
         "--endpoint-mode",
         choices=ENDPOINT_MODES,
         default="auto",
@@ -673,8 +737,13 @@ def build_parser():
     )
     config_parser.set_defaults(func=command_config)
 
-    test_parser = sub.add_parser("test", help="Safely detect and save the usable image endpoint")
+    test_parser = sub.add_parser("test", help="Diagnose image endpoint reachability without generating")
     test_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
+    test_parser.add_argument(
+        "--select",
+        action="store_true",
+        help="When endpoint_mode is auto, save the first reachable diagnostic candidate",
+    )
     test_parser.set_defaults(func=command_test)
 
     gen_parser = sub.add_parser("generate", help="Generate an image to a target path")

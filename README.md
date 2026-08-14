@@ -39,16 +39,20 @@ Users must provide their own gateway URL and API key. No real credentials are in
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py config \
   --base 'YOUR_URL' \
-  --model auto
+  --model gpt-image-2 \
+  --responses-model gpt-5.4 \
+  --endpoint-mode images
 ```
 
-Omit `--key` to enter the key through a hidden terminal prompt. On the first generation, the skill checks the provider model list when available, then tries `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image` only when the previous model was explicitly rejected. The first accepted model is cached for later calls.
+Omit `--key` to enter the key through a hidden terminal prompt. Explicit `images` or `responses` modes are operator overrides. Use `auto` only when diagnostic endpoint selection is desired.
 
 Test connectivity:
 
 ```bash
 python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py test
 ```
+
+This command is read-only. It reports endpoint reachability, and HTTP 400/422 does not prove image generation works. Use `test --select` only to opt into saving a reachable candidate while `endpoint_mode` is `auto`; it never overrides an explicit mode.
 
 Generate an image:
 
@@ -97,9 +101,9 @@ If all candidates are rejected, the skill reports the endpoint and attempted mod
 - Python 3
 - `requests`
 
-## Endpoint Cache
+## Endpoint Selection
 
-The selected endpoint is cached with a SHA-256 fingerprint of the configured base URL and API key. Reusing the same configuration skips probing; changing either value safely reselects the endpoint before the next generation. Existing caches are upgraded after one safe probe.
+`endpoint_mode` stores operator intent. A real successful generation records `last_successful_mode` with a SHA-256 fingerprint of the configured base URL and API key. Auto mode prefers that proven endpoint; safe probes remain diagnostic and never masquerade as successful generation. A 5xx response never triggers an automatic second generation request or endpoint fallback.
 
 ## Security
 

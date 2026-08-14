@@ -43,26 +43,36 @@ def make_args(**overrides):
         "format": "png",
         "compression": 100,
         "model": None,
+        "out": None,
+        "background": False,
+        "stream": False,
+        "timeout": 30,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
 
 
 def make_config():
-    fingerprint = gateway.model_fingerprint(
-        "https://gateway.example/v1", "secret", "responses"
-    )
+    raw_base_url = "https://gateway.example/v1"
+    api_key = "secret"
+    endpoint_fingerprint = gateway.endpoint_fingerprint(raw_base_url, api_key)
+    fingerprint = gateway.model_fingerprint(raw_base_url, api_key, "responses")
     return {
-        "raw_base_url": "https://gateway.example/v1",
+        "raw_base_url": raw_base_url,
         "base_url": "https://gateway.example/v1",
         "responses_base_url": "https://gateway.example/responses",
-        "api_key": "secret",
+        "api_key": api_key,
         "model": "auto",
         "responses_model": "",
         "model_candidates": list(gateway.DEFAULT_MODEL_CANDIDATES),
         "resolved_model": "",
         "model_cache_is_current": False,
         "model_fingerprint": fingerprint,
+        "endpoint_mode": "auto",
+        "endpoint_mode_is_current": False,
+        "endpoint_fingerprint": endpoint_fingerprint,
+        "last_successful_mode": "",
+        "last_successful_mode_is_current": False,
     }
 
 
@@ -290,6 +300,61 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIsNone(args.key)
         self.assertEqual(args.model, "auto")
 
+    def test_config_accepts_and_persists_a_separate_responses_model(self):
+        parser = gateway.build_parser()
+        args = parser.parse_args(
+            [
+                "config",
+                "--base",
+                "https://gateway.example",
+                "--key",
+                "secret",
+                "--model",
+                "gpt-image-2",
+                "--responses-model",
+                "gpt-5.4",
+                "--endpoint-mode",
+                "images",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            with mock.patch.object(gateway, "CONFIG_PATH", config_path):
+                gateway.command_config(args)
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["model"], "gpt-image-2")
+        self.assertEqual(saved["responses_model"], "gpt-5.4")
+        self.assertEqual(saved["endpoint_mode"], "images")
+
+    def test_config_without_responses_model_preserves_existing_value(self):
+        parser = gateway.build_parser()
+        args = parser.parse_args(
+            [
+                "config",
+                "--base",
+                "https://gateway.example",
+                "--key",
+                "secret",
+                "--model",
+                "gpt-image-2",
+                "--endpoint-mode",
+                "images",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            config_path.write_text(
+                json.dumps({"responses_model": "gpt-5.4"}), encoding="utf-8"
+            )
+            with mock.patch.object(gateway, "CONFIG_PATH", config_path):
+                gateway.command_config(args)
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["responses_model"], "gpt-5.4")
+
     def test_resolved_model_cache_is_scoped_to_endpoint_mode(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "local_config.json"
@@ -317,6 +382,251 @@ class ConfigurationTests(unittest.TestCase):
                 cfg = gateway.load_config()
 
         self.assertFalse(cfg["model_cache_is_current"])
+
+
+class EndpointSelectionV2Tests(unittest.TestCase):
+    def _write_config(self, path, endpoint_mode="auto", **extra):
+        raw_base_url = "https://gateway.example"
+        api_key = "sk-secret-value"
+        payload = {
+            "base_url": raw_base_url,
+            "api_key": api_key,
+            "model": "gpt-image-2",
+            "responses_model": "gpt-5.4",
+            "endpoint_mode": endpoint_mode,
+        }
+        payload.update(extra)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    def test_manual_images_mode_is_not_overwritten_by_test(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="images")
+            responses = [FakeResponse(502), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["endpoint_mode"], "images")
+
+    def test_manual_mode_is_probed_first_even_when_last_success_differs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            fingerprint = gateway.endpoint_fingerprint(
+                "https://gateway.example", "sk-secret-value"
+            )
+            self._write_config(
+                config_path,
+                endpoint_mode="images",
+                last_successful_mode="responses",
+                last_successful_mode_fingerprint=fingerprint,
+            )
+            responses = [FakeResponse(400), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(
+                    gateway.requests, "post", side_effect=responses
+                ) as post,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+
+        self.assertTrue(post.call_args_list[0].args[0].endswith("/images/generations"))
+
+    def test_manual_mode_is_not_overwritten_even_with_test_select(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="images")
+            responses = [FakeResponse(502), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=True))
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["endpoint_mode"], "images")
+
+    def test_default_test_is_read_only_in_auto_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            original = self._write_config(config_path, endpoint_mode="auto")
+            responses = [FakeResponse(502), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved, original)
+
+    def test_400_probe_is_reported_as_unverified_not_generation_capable(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="auto")
+            responses = [FakeResponse(502), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(stdout),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+
+        output = stdout.getvalue()
+        self.assertIn("responses=400 (reachable, generation unverified)", output)
+        self.assertNotIn("Selected endpoint mode", output)
+
+    def test_test_select_updates_only_auto_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="auto")
+            responses = [FakeResponse(502), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=True))
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["endpoint_mode"], "responses")
+
+    def test_auto_generation_prefers_last_successful_mode_without_probing(self):
+        cfg = make_config()
+        cfg.update(
+            {
+                "endpoint_mode": "auto",
+                "last_successful_mode": "images",
+                "last_successful_mode_is_current": True,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_path = Path(temp_dir) / "image.png"
+            args = make_args(out=str(out_path), background=False, stream=False)
+            with (
+                mock.patch.object(gateway, "load_config", return_value=cfg),
+                mock.patch.object(
+                    gateway,
+                    "probe_endpoints",
+                    side_effect=AssertionError("last successful mode should skip probing"),
+                ),
+                mock.patch.object(gateway, "fetch_available_models", return_value=set()),
+                mock.patch.object(
+                    gateway,
+                    "generate_with_images",
+                    return_value=(b"image", "gpt-image-2", "generate"),
+                ) as generate,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_generate(args)
+
+        generate.assert_called_once()
+
+    def test_successful_images_generation_caches_last_successful_mode(self):
+        image_bytes = b"generated-image"
+        response = FakeResponse(
+            200,
+            {"data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}]},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="images")
+            with mock.patch.object(gateway, "CONFIG_PATH", config_path):
+                cfg = gateway.load_config()
+                with mock.patch.object(gateway.requests, "post", return_value=response):
+                    raw, _, _ = gateway.generate_with_images(
+                        cfg, make_args(), timeout=30, output_format="png"
+                    )
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw, image_bytes)
+        self.assertEqual(saved["last_successful_mode"], "images")
+
+    def test_successful_responses_generation_caches_last_successful_mode(self):
+        image_bytes = b"generated-image"
+        response = FakeResponse(
+            200,
+            {
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "result": base64.b64encode(image_bytes).decode("ascii"),
+                    }
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="responses")
+            with mock.patch.object(gateway, "CONFIG_PATH", config_path):
+                cfg = gateway.load_config()
+                with mock.patch.object(gateway.requests, "post", return_value=response):
+                    raw, _ = gateway.generate_with_responses(
+                        cfg, make_args(), timeout=30, output_format="png"
+                    )
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw, image_bytes)
+        self.assertEqual(saved["last_successful_mode"], "responses")
+
+    def test_responses_503_does_not_fallback_or_cache_success(self):
+        response = FakeResponse(503, text="Service temporarily unavailable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            original = self._write_config(config_path, endpoint_mode="responses")
+            with mock.patch.object(gateway, "CONFIG_PATH", config_path):
+                cfg = gateway.load_config()
+                with (
+                    mock.patch.object(gateway.requests, "post", return_value=response) as post,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    gateway.generate_with_responses(
+                        cfg, make_args(), timeout=30, output_format="png"
+                    )
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(saved, original)
+
+    def test_test_output_masks_the_full_api_key(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "local_config.json"
+            self._write_config(config_path, endpoint_mode="images")
+            responses = [FakeResponse(400), FakeResponse(400)]
+
+            with (
+                mock.patch.object(gateway, "CONFIG_PATH", config_path),
+                mock.patch.object(gateway.requests, "post", side_effect=responses),
+                contextlib.redirect_stdout(stdout),
+            ):
+                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+
+        self.assertNotIn("sk-secret-value", stdout.getvalue())
 
 
 class StreamingResponse:
