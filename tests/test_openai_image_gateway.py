@@ -399,6 +399,60 @@ class EndpointSelectionV2Tests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return payload
 
+    def test_default_test_uses_read_only_model_lookup(self):
+        cfg = make_config()
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(gateway, "load_config", return_value=cfg),
+            mock.patch.object(
+                gateway.requests,
+                "get",
+                return_value=FakeResponse(200, {"data": []}),
+            ) as get,
+            mock.patch.object(gateway.requests, "post") as post,
+            contextlib.redirect_stdout(stdout),
+        ):
+            gateway.command_test(
+                argparse.Namespace(
+                    timeout=30,
+                    select=False,
+                    probe_generation_route=False,
+                )
+            )
+
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], "https://gateway.example/v1/models")
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        post.assert_not_called()
+        self.assertIn("Read-only check: 200", stdout.getvalue())
+
+    def test_explicit_route_probe_posts_with_probe_header(self):
+        cfg = make_config()
+
+        with (
+            mock.patch.object(gateway, "load_config", return_value=cfg),
+            mock.patch.object(
+                gateway.requests,
+                "post",
+                return_value=FakeResponse(400),
+            ) as post,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            gateway.command_test(
+                argparse.Namespace(
+                    timeout=30,
+                    select=False,
+                    probe_generation_route=True,
+                )
+            )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(
+            post.call_args.kwargs["headers"].get("X-Image-Gateway-Probe"),
+            "1",
+        )
+
     def test_manual_images_mode_is_not_overwritten_by_test(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "local_config.json"
