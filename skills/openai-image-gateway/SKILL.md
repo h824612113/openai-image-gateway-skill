@@ -121,6 +121,7 @@ Optional generation overrides:
 - `endpoint_mode` stores operator intent. `last_successful_mode` is runtime-owned evidence written only after a real generation succeeds.
 - A generation call uses one endpoint only and never falls back after HTTP 502/503 or another ambiguous failure.
 - Model discovery is read-only when `/models` is available. Model fallback only continues after a definitive model rejection; it never retries uncertain generation states.
+- Passing `generate --model MODEL_NAME` bypasses optional `/models` discovery and sends that model directly to the configured generation endpoint.
 - The first accepted model is cached with a configuration fingerprint and reused until the base URL, API key, or endpoint mode changes.
 - `responses_model` is tried before the Images `model` when the Responses endpoint is selected.
 - Success caches are bound to a SHA-256 fingerprint of the configured base URL and API key.

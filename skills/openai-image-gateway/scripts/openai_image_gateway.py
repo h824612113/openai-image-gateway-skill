@@ -721,7 +721,7 @@ def command_generate(args):
                 fail(f"--{flag} requires the responses endpoint, but images was selected")
 
     available_models = set()
-    if not cfg.get("model_cache_is_current"):
+    if not args.model and not cfg.get("model_cache_is_current"):
         available_models = fetch_available_models(cfg, args.timeout)
 
     if endpoint_mode == "responses":

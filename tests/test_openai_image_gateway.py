@@ -77,6 +77,33 @@ def make_config():
 
 
 class ModelFallbackTests(unittest.TestCase):
+    def test_explicit_model_skips_optional_model_discovery(self):
+        cfg = make_config()
+        cfg.update(
+            {
+                "endpoint_mode": "images",
+                "model_cache_is_current": False,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_path = Path(temp_dir) / "image.png"
+            args = make_args(out=str(out_path), model="gpt-image-2")
+            with (
+                mock.patch.object(gateway, "load_config", return_value=cfg),
+                mock.patch.object(gateway, "fetch_available_models") as discover,
+                mock.patch.object(
+                    gateway,
+                    "generate_with_images",
+                    return_value=(b"image", "gpt-image-2", "generate"),
+                ) as generate,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                gateway.command_generate(args)
+
+        discover.assert_not_called()
+        self.assertEqual(generate.call_args.args[-1], set())
+
     def test_candidates_include_unversioned_alias_last(self):
         cfg = make_config()
 
