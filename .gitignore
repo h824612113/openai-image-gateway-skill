@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+.worktrees/
 skills/openai-image-gateway/local_config.json
 
 # Default output directory for `generate`, plus stray images written to the repo root.
