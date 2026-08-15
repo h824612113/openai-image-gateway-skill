@@ -464,7 +464,13 @@ class EndpointSelectionV2Tests(unittest.TestCase):
                 mock.patch.object(gateway.requests, "post", side_effect=responses),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+                gateway.command_test(
+                    argparse.Namespace(
+                        timeout=30,
+                        select=False,
+                        probe_generation_route=True,
+                    )
+                )
 
             saved = json.loads(config_path.read_text(encoding="utf-8"))
 
@@ -491,7 +497,13 @@ class EndpointSelectionV2Tests(unittest.TestCase):
                 ) as post,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+                gateway.command_test(
+                    argparse.Namespace(
+                        timeout=30,
+                        select=False,
+                        probe_generation_route=True,
+                    )
+                )
 
         self.assertTrue(post.call_args_list[0].args[0].endswith("/images/generations"))
 
@@ -521,6 +533,11 @@ class EndpointSelectionV2Tests(unittest.TestCase):
             with (
                 mock.patch.object(gateway, "CONFIG_PATH", config_path),
                 mock.patch.object(gateway.requests, "post", side_effect=responses),
+                mock.patch.object(
+                    gateway.requests,
+                    "get",
+                    return_value=FakeResponse(200, {"data": []}),
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 gateway.command_test(argparse.Namespace(timeout=30, select=False))
@@ -541,7 +558,13 @@ class EndpointSelectionV2Tests(unittest.TestCase):
                 mock.patch.object(gateway.requests, "post", side_effect=responses),
                 contextlib.redirect_stdout(stdout),
             ):
-                gateway.command_test(argparse.Namespace(timeout=30, select=False))
+                gateway.command_test(
+                    argparse.Namespace(
+                        timeout=30,
+                        select=False,
+                        probe_generation_route=True,
+                    )
+                )
 
         output = stdout.getvalue()
         self.assertIn("responses=400 (reachable, generation unverified)", output)
@@ -676,6 +699,11 @@ class EndpointSelectionV2Tests(unittest.TestCase):
             with (
                 mock.patch.object(gateway, "CONFIG_PATH", config_path),
                 mock.patch.object(gateway.requests, "post", side_effect=responses),
+                mock.patch.object(
+                    gateway.requests,
+                    "get",
+                    return_value=FakeResponse(200, {"data": []}),
+                ),
                 contextlib.redirect_stdout(stdout),
             ):
                 gateway.command_test(argparse.Namespace(timeout=30, select=False))

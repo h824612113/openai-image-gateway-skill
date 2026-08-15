@@ -448,6 +448,7 @@ def probe_endpoint(cfg, endpoint_mode, timeout):
             headers={
                 "Authorization": f"Bearer {cfg['api_key']}",
                 "Content-Type": "application/json",
+                "X-Image-Gateway-Probe": "1",
             },
             json={},
             timeout=timeout,
@@ -465,6 +466,23 @@ def probe_endpoint(cfg, endpoint_mode, timeout):
     else:
         detail = f"{response.status_code} (unreachable)"
     return {"mode": endpoint_mode, "reachable": reachable, "detail": detail}
+
+
+def read_only_check(cfg, timeout):
+    try:
+        response = requests.get(
+            f"{cfg['base_url']}/models",
+            headers={"Authorization": f"Bearer {cfg['api_key']}"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        return {"reachable": False, "detail": f"error ({exc})"}
+
+    return {
+        "reachable": 200 <= response.status_code < 300,
+        "detail": str(response.status_code),
+    }
 
 
 def probe_endpoints(cfg, timeout):
@@ -665,8 +683,15 @@ def command_test(args):
     print(f"Base URL: {cfg['base_url']}")
     print(f"Responses URL: {cfg['responses_base_url']}")
     print(f"API Key: {mask_key(cfg['api_key'])}")
+    probe_generation_route = getattr(args, "probe_generation_route", False)
+    if not probe_generation_route and not args.select:
+        result = read_only_check(cfg, args.timeout)
+        print(f"Read-only check: {result['detail']}")
+        print(f"Configured endpoint mode: {cfg['endpoint_mode']} (config unchanged)")
+        return
+
     probe_results = probe_endpoints(cfg, args.timeout)
-    print(f"Safe probes: {', '.join(format_probe_results(probe_results))}")
+    print(f"Generation-route diagnostics: {', '.join(format_probe_results(probe_results))}")
     if not args.select:
         print(f"Configured endpoint mode: {cfg['endpoint_mode']} (config unchanged)")
         return
@@ -743,6 +768,11 @@ def build_parser():
         "--select",
         action="store_true",
         help="When endpoint_mode is auto, save the first reachable diagnostic candidate",
+    )
+    test_parser.add_argument(
+        "--probe-generation-route",
+        action="store_true",
+        help="POST zero-prompt diagnostics to image routes; does not generate an image",
     )
     test_parser.set_defaults(func=command_test)
 
