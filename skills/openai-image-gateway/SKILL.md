@@ -61,7 +61,18 @@ Connectivity test:
 python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py test
 ```
 
-`test` is read-only by default. It reports reachability and never changes `endpoint_mode`. To convert `auto` into the first reachable diagnostic candidate, opt in explicitly:
+`test` performs a read-only `GET /models` gateway and authentication check; it does not verify an image-generation route and never changes `endpoint_mode`.
+
+To deliberately probe the Images and Responses generation routes without creating an image, use:
+
+```bash
+python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py test \
+  --probe-generation-route
+```
+
+This sends a zero-prompt diagnostic POST marked with `X-Image-Gateway-Probe: 1`. Gateways that support this marker can keep it out of image-generation failure alerts. A 400/422 response proves only route reachability.
+
+To convert `auto` into the first reachable diagnostic candidate, opt in explicitly:
 
 ```bash
 python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py test --select
@@ -92,7 +103,7 @@ Optional generation overrides:
 ## Workflow
 
 1. If `local_config.json` is missing or incomplete, run `config` and choose `images`, `responses`, or `auto` deliberately.
-2. Run `test` for read-only diagnostics. Treat HTTP 400/422 as endpoint reachability only, not image-generation capability.
+2. Run `test` for read-only gateway and authentication diagnostics. Use `test --probe-generation-route` only when you need image-route reachability; treat HTTP 400/422 from that explicit diagnostic as route reachability only, not image-generation capability.
 3. Run `generate` when the user gives a prompt and target path. Explicit endpoint modes are always honored.
 4. In `auto`, prefer a fingerprint-matched `last_successful_mode`; otherwise probe once and use one reachable candidate without caching it as successful.
 5. After real image bytes are extracted, cache `last_successful_mode` and the accepted model.
@@ -104,7 +115,7 @@ Optional generation overrides:
 
 - The script normalizes `base_url` so both `https://host` and `https://host/v1` work.
 - The script supports both `b64_json` responses and URL-based image responses.
-- `test` sends an empty request without a prompt, model, or image-generation tool, so it cannot initiate image generation.
+- `test` uses a read-only model-list request and cannot initiate image generation. `test --probe-generation-route` sends an empty diagnostic request and identifies it with `X-Image-Gateway-Probe: 1`.
 - `test` does not write configuration unless `--select` is present, and explicit endpoint modes are immutable to testing.
 - HTTP 400/422 from a safe probe means the route exists; it never means the route can generate images.
 - `endpoint_mode` stores operator intent. `last_successful_mode` is runtime-owned evidence written only after a real generation succeeds.
