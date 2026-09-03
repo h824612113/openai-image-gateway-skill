@@ -97,6 +97,9 @@ post-completion download error and never re-submits the billable image request.
   or a public HTTP(S) URL (`images`). URL arrays are retried in the
   `{"image_url": "..."}` object shape when a compatible gateway explicitly
   asks for that form.
+- Synchronous Images generation continues through configured image-model
+  candidates after HTTP or transport failures; async submissions stay bound
+  to one idempotency key and task.
 - `--format` controls both the requested `output_format` and the local file
   extension. `--quality` and `--compression` are forwarded when supported by
   the selected Images model.

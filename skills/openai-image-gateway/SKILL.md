@@ -131,6 +131,9 @@ Pass `--background` to opt into the async route:
   public HTTP(S) URL (`images`). If the gateway returns the explicit
   `images[].image_url is required` validation error, the URL is retried in the
   object form `{"image_url": "..."}`.
+- Synchronous Images requests try the next configured image model after HTTP
+  or transport failures. Async requests keep the same task/idempotency key and
+  never switch models after a submission becomes ambiguous.
 
 Images requests do not force `response_format`; the parser accepts either URL
 or Base64 output. `--background` explicitly enables async mode and is accepted

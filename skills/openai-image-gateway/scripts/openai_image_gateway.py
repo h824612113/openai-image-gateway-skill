@@ -913,6 +913,7 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
     }
 
     candidates = model_candidates(cfg, "responses", args.model, available_models)
+    failures = []
     for model in candidates:
         responses_payload = {
             "model": model,
@@ -923,13 +924,17 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
             responses_payload["background"] = True
         if stream:
             responses_payload["stream"] = True
-        resp = requests.post(
-            cfg["responses_base_url"],
-            headers=headers,
-            json=responses_payload,
-            timeout=timeout,
-            stream=stream,
-        )
+        try:
+            resp = requests.post(
+                cfg["responses_base_url"],
+                headers=headers,
+                json=responses_payload,
+                timeout=timeout,
+                stream=stream,
+            )
+        except requests.RequestException as exc:
+            failures.append(f"{model}: {exc}")
+            continue
         if resp.status_code == 200:
             if stream:
                 raw = extract_image_bytes_from_stream(resp)
@@ -943,14 +948,13 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
             raw = extract_image_bytes_from_responses(payload)
             save_generation_success(cfg, "responses", model)
             return raw, model
-        if is_model_rejection(resp):
-            continue
-        fail(f"HTTP {resp.status_code}: {error_text(resp)}")
+        failures.append(f"{model}: HTTP {resp.status_code}: {error_text(resp)}")
+        continue
 
     fail(
         "No configured image model was accepted by "
         f"{cfg['responses_base_url']}. Tried: {', '.join(candidates)}. "
-        "Ask the provider for the exact image-generation model ID."
+        "Failures: " + "; ".join(failures)
     )
 
 
@@ -1074,7 +1078,17 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                     timeout=timeout,
                 )
 
-            response = submit(post_url_edit, json_payload)
+            try:
+                response = submit(post_url_edit, json_payload)
+            except requests.RequestException as exc:
+                if candidate_index + 1 < len(candidates):
+                    print(
+                        f"Image model {model} failed with network error {exc}; "
+                        "trying the next configured model.",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise
             # The Image2 document accepts URL strings, while some gateways
             # expose the OpenAI-compatible object form.  A validation-only 400
             # is safe to retry with the alternate shape and a fresh key because
@@ -1082,7 +1096,17 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             if image_url_shape_error(response):
                 json_payload["images"] = [{"image_url": args.image.strip()}]
                 idempotency_key = str(uuid.uuid4()) if async_mode else None
-                response = submit(post_url_edit, json_payload, key=idempotency_key)
+                try:
+                    response = submit(post_url_edit, json_payload, key=idempotency_key)
+                except requests.RequestException as exc:
+                    if candidate_index + 1 < len(candidates):
+                        print(
+                            f"Image model {model} failed with network error {exc}; "
+                            "trying the next configured model.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    raise
         elif edit:
             image_path = Path(args.image).expanduser()
             if not image_path.is_file():
@@ -1104,7 +1128,17 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                         timeout=timeout,
                     )
 
-            response = submit(post_file_edit, form_data, reference_path=image_path)
+            try:
+                response = submit(post_file_edit, form_data, reference_path=image_path)
+            except requests.RequestException as exc:
+                if candidate_index + 1 < len(candidates):
+                    print(
+                        f"Image model {model} failed with network error {exc}; "
+                        "trying the next configured model.",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise
         else:
             def post_generation(key, request_payload=payload):
                 return requests.post(
@@ -1116,7 +1150,17 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                     timeout=timeout,
                 )
 
-            response = submit(post_generation, payload)
+            try:
+                response = submit(post_generation, payload)
+            except requests.RequestException as exc:
+                if candidate_index + 1 < len(candidates):
+                    print(
+                        f"Image model {model} failed with network error {exc}; "
+                        "trying the next configured model.",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise
 
         if response.status_code in (200, 202):
             response_payload = parse_images_response(response, cfg, timeout, async_mode)
@@ -1134,6 +1178,13 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                 hint = "；异步提交也失败，请检查网关 Images 上游和模型能力"
             else:
                 hint = "；可重试 `--background` 走异步 Images 接口，或检查网关 Images 上游"
+        if not async_mode and candidate_index + 1 < len(candidates):
+            print(
+                f"Image model {model} failed with HTTP {response.status_code}; "
+                "trying the next configured model.",
+                file=sys.stderr,
+            )
+            continue
         fail(f"HTTP {response.status_code}: {error_text(response)}{hint}")
 
     fail(
