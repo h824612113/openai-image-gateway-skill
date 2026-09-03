@@ -8,8 +8,10 @@ import mimetypes
 import os
 import sys
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -24,6 +26,14 @@ DEFAULT_MODEL_CANDIDATES = (
 )
 ENDPOINT_MODES = ("auto", "images", "responses")
 BACKGROUND_POLL_SECONDS = 2
+IMAGE_POLL_MIN_SECONDS = 5
+IMAGE_TASK_STATUSES = {"queued", "in_progress"}
+IMAGE_SUBMISSION_RETRY_STATUSES = {429, 502, 503, 504}
+IMAGE_SUBMISSION_MAX_ATTEMPTS = 2
+IMAGE_DOWNLOAD_RETRY_STATUSES = {429, 500, 502, 503, 504}
+IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
+IMAGE_DOWNLOAD_RETRY_SECONDS = 2
+PENDING_REQUEST_FILENAME = "pending_image_request.json"
 PARTIAL_IMAGE_COUNT = 3
 MODEL_REJECTION_CODES = {"invalid_model", "model_not_found", "unsupported_model"}
 MODEL_REJECTION_PHRASES = (
@@ -41,14 +51,20 @@ def fail(message):
 
 
 def normalize_base_url(raw):
+    """Return the configured API prefix without inventing a ``/v1`` segment.
+
+    OpenAI-compatible gateways do not agree on whether Images lives below
+    ``/v1``.  Treating a bare host as ``<host>/v1`` changed a configured
+    endpoint and broke gateways that expose ``/images/*`` at their root.  The
+    operator can still configure a ``/v1`` suffix when that is the provider's
+    actual API prefix.
+    """
     raw = (raw or "").strip().rstrip("/")
     if not raw:
         return ""
     if raw.endswith("/responses"):
         raw = raw[: -len("/responses")].rstrip("/")
-    if raw.endswith("/v1"):
-        return raw
-    return f"{raw}/v1"
+    return raw
 
 
 def responses_endpoint(raw):
@@ -138,11 +154,17 @@ def load_config():
             and active_model_mode in ("images", "responses")
         ),
         "endpoint_mode": endpoint_mode,
-        "endpoint_mode_is_current": endpoint_mode in ("images", "responses"),
         "endpoint_fingerprint": current_fingerprint,
         "last_successful_mode": last_successful_mode,
         "last_successful_mode_is_current": last_successful_mode_is_current,
     }
+
+
+def write_config(payload):
+    CONFIG_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 def save_config(base_url, api_key, model, responses_model, endpoint_mode):
@@ -168,8 +190,7 @@ def save_config(base_url, api_key, model, responses_model, endpoint_mode):
         for key in ("last_successful_mode", "last_successful_mode_fingerprint"):
             if existing.get(key):
                 payload[key] = existing[key]
-    CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(CONFIG_PATH, 0o600)
+    write_config(payload)
     print(f"Saved config: {CONFIG_PATH}")
     print(f"Images Base URL: {normalize_base_url(payload['base_url'])}")
     print(f"Responses URL: {responses_endpoint(payload['base_url'])}")
@@ -182,28 +203,19 @@ def save_config(base_url, api_key, model, responses_model, endpoint_mode):
 def save_endpoint_mode(endpoint_mode):
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     data["endpoint_mode"] = endpoint_mode
-    data.pop("endpoint_mode_fingerprint", None)
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(CONFIG_PATH, 0o600)
+    write_config(data)
 
 
-def save_last_successful_mode(cfg, endpoint_mode):
+def save_generation_success(cfg, endpoint_mode, model):
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     data["last_successful_mode"] = endpoint_mode
     data["last_successful_mode_fingerprint"] = cfg["endpoint_fingerprint"]
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(CONFIG_PATH, 0o600)
-
-
-def save_resolved_model(cfg, endpoint_mode, model):
-    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     data["resolved_model"] = model
     data["resolved_endpoint_mode"] = endpoint_mode
     data["model_fingerprint"] = model_fingerprint(
         cfg["raw_base_url"], cfg["api_key"], endpoint_mode
     )
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(CONFIG_PATH, 0o600)
+    write_config(data)
 
 
 def model_candidates(cfg, endpoint_mode, override_model=None, available_models=None):
@@ -243,32 +255,49 @@ def model_candidates(cfg, endpoint_mode, override_model=None, available_models=N
     return ordered
 
 
+def model_list_urls(cfg):
+    """Return conservative, read-only model-list candidates for a gateway.
+
+    Images uses the configured prefix verbatim.  A few gateways expose Images
+    at their host root but keep the model list below ``/v1``; trying that
+    second location keeps ``test`` and optional model discovery useful without
+    changing the generation route.
+    """
+    base_url = cfg["base_url"].rstrip("/")
+    candidates = [f"{base_url}/models"]
+    parsed = urlparse(base_url)
+    if not parsed.path.rstrip("/"):
+        candidates.append(f"{base_url}/v1/models")
+    return tuple(candidates)
+
+
 def fetch_available_models(cfg, timeout):
-    try:
-        response = requests.get(
-            f"{cfg['base_url']}/models",
-            headers={"Authorization": f"Bearer {cfg['api_key']}"},
-            timeout=timeout,
-            allow_redirects=False,
-        )
-    except requests.RequestException:
-        return set()
+    for url in model_list_urls(cfg):
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            continue
 
-    if response.status_code != 200:
-        return set()
-    try:
-        payload = response.json()
-    except (ValueError, json.JSONDecodeError):
-        return set()
+        if response.status_code != 200:
+            continue
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            continue
 
-    data = payload.get("data")
-    if not isinstance(data, list):
-        return set()
-    return {
-        item["id"]
-        for item in data
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+        data = payload.get("data")
+        if isinstance(data, list):
+            return {
+                item["id"]
+                for item in data
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+    return set()
 
 
 def error_text(resp):
@@ -311,7 +340,94 @@ def is_model_rejection(resp):
     return any(phrase in message for phrase in MODEL_REJECTION_PHRASES)
 
 
-def extract_image_bytes(payload, api_key, timeout):
+def result_url_host(url):
+    """Return a non-secret host label for diagnostics."""
+    parsed = urlparse(str(url))
+    return parsed.hostname or parsed.netloc or "(unknown)"
+
+
+def result_download_retry_seconds(response):
+    """Use a bounded Retry-After delay for a transient result download error."""
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is None:
+        retry_after = next(
+            (value for key, value in headers.items() if str(key).lower() == "retry-after"),
+            None,
+        )
+    try:
+        delay = int(retry_after)
+    except (TypeError, ValueError):
+        delay = IMAGE_DOWNLOAD_RETRY_SECONDS
+    # A signed URL should be fetched promptly; never let a provider-supplied
+    # header make the CLI sleep indefinitely.
+    return min(30, max(IMAGE_DOWNLOAD_RETRY_SECONDS, delay))
+
+
+def download_result_image(url, timeout=120):
+    """Download one completed result URL without re-submitting generation.
+
+    Image2 result URLs are signed public URLs.  A task has already completed by
+    this point, so retries are restricted to this exact URL and never invoke a
+    second POST.  The URL may contain a provider token; diagnostics therefore
+    expose only its host.
+    """
+    parsed = urlparse(str(url).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        fail(f"Image result URL is invalid (host {result_url_host(url)})")
+
+    last_error = None
+    for attempt in range(1, IMAGE_DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            # Signed result URLs are public; forwarding the gateway Bearer can
+            # leak credentials to a different provider or invalidate signing.
+            response = requests.get(url, timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = f"network error: {exc}"
+            if attempt < IMAGE_DOWNLOAD_MAX_ATTEMPTS:
+                print(
+                    f"Transient result-image download error from host {result_url_host(url)}; "
+                    f"retrying ({attempt}/{IMAGE_DOWNLOAD_MAX_ATTEMPTS - 1}).",
+                    file=sys.stderr,
+                )
+                time.sleep(IMAGE_DOWNLOAD_RETRY_SECONDS)
+                continue
+            fail(
+                f"Image download failed for result host {result_url_host(url)}: "
+                f"{last_error}. The generation task is already complete; do not resubmit."
+            )
+
+        if response.status_code == 200:
+            return response.content
+
+        last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+        if response.status_code in IMAGE_DOWNLOAD_RETRY_STATUSES and attempt < IMAGE_DOWNLOAD_MAX_ATTEMPTS:
+            print(
+                f"Transient result-image download HTTP {response.status_code} from host "
+                f"{result_url_host(url)}; retrying ({attempt}/{IMAGE_DOWNLOAD_MAX_ATTEMPTS - 1}).",
+                file=sys.stderr,
+            )
+            time.sleep(result_download_retry_seconds(response))
+            continue
+        fail(
+            f"Image download failed for result host {result_url_host(url)}: {last_error}. "
+            "The generation task is already complete; do not resubmit."
+        )
+
+    # The loop always returns or calls fail; retain a defensive guard for type
+    # checkers and future changes to the retry policy.
+    fail(
+        f"Image download failed for result host {result_url_host(url)}: "
+        "retry budget exhausted. The generation task is already complete; do not resubmit."
+    )
+
+
+def extract_image_bytes(payload, api_key=None, timeout=120):
+    """Extract image bytes from an Images API response.
+
+    ``api_key`` remains accepted for compatibility with older callers but is
+    deliberately ignored when downloading signed result URLs.
+    """
     data = payload.get("data")
     if not isinstance(data, list):
         fail(f"Unexpected generation payload: {payload}")
@@ -325,15 +441,262 @@ def extract_image_bytes(payload, api_key, timeout):
                 return base64.b64decode(value)
         url = item.get("url")
         if url:
-            resp = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=timeout,
-            )
-            if resp.status_code != 200:
-                fail(f"Image download failed HTTP {resp.status_code}: {resp.text[:500]}")
-            return resp.content
+            return download_result_image(url, timeout=timeout)
     fail("No image data returned")
+
+
+def image_poll_after(value, fallback=IMAGE_POLL_MIN_SECONDS):
+    """Normalize a provider poll hint while enforcing Image2's 5s minimum."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = fallback
+    return max(IMAGE_POLL_MIN_SECONDS, value)
+
+
+def retry_after_seconds(response, fallback=IMAGE_POLL_MIN_SECONDS):
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is None:
+        retry_after = next(
+            (value for key, value in headers.items() if str(key).lower() == "retry-after"),
+            None,
+        )
+    return image_poll_after(retry_after, fallback=fallback)
+
+
+def image_task_url(cfg, task_id):
+    # Task IDs are opaque provider values; quote them so a malformed value
+    # cannot alter the polling path.
+    return f"{cfg['base_url']}/images/tasks/{quote(str(task_id), safe='')}"
+
+
+def normalize_idempotency_key(value):
+    """Validate a caller-supplied key without allowing log/control injection."""
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) > 255 or any(ord(char) < 32 or ord(char) == 127 for char in key):
+        fail("Invalid --idempotency-key: use a non-empty value up to 255 characters")
+    return key
+
+
+def image_request_fingerprint(endpoint, payload, reference_path=None):
+    """Create a non-secret fingerprint for an exact Images request shape."""
+    material = {"endpoint": endpoint, "payload": payload}
+    if reference_path is not None:
+        path = Path(reference_path).expanduser()
+        try:
+            material["reference_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            material["reference_name"] = path.name
+        except OSError:
+            # Validation happens before submission; this keeps diagnostics safe
+            # if a file disappears between validation and fingerprinting.
+            material["reference_name"] = path.name
+            material["reference_sha256"] = "unavailable"
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def pending_request_path():
+    """Return a config-adjacent, user-private recovery record path."""
+    # CONFIG_PATH can be a symlink from a checked-out skill to ~/.codex.  Resolve
+    # it so recovery metadata does not unexpectedly dirty the source checkout.
+    try:
+        config_path = CONFIG_PATH.resolve()
+    except OSError:
+        config_path = CONFIG_PATH
+    return config_path.parent / PENDING_REQUEST_FILENAME
+
+
+def save_pending_request(endpoint, model, idempotency_key, fingerprint):
+    """Persist only replay metadata; never persist the prompt or API key."""
+    if not idempotency_key:
+        return
+    path = pending_request_path()
+    record = {
+        "endpoint": endpoint,
+        "model": model,
+        "idempotency_key": idempotency_key,
+        "request_fingerprint": fingerprint,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    try:
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        # Recovery metadata is best effort and must never hide the upstream
+        # error or turn a successful generation into a local failure.
+        return
+
+
+def clear_pending_request(idempotency_key):
+    """Remove recovery metadata only when it belongs to the completed request."""
+    if not idempotency_key:
+        return
+    path = pending_request_path()
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if record.get("idempotency_key") != idempotency_key:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        return
+
+
+def ambiguous_image_submission(reason, endpoint, model, idempotency_key, fingerprint):
+    """Stop after one safe replay and leave exact replay instructions."""
+    save_pending_request(endpoint, model, idempotency_key, fingerprint)
+    fail(
+        "Images submission outcome is ambiguous "
+        f"({reason}); the gateway may still be processing it. "
+        f"Replay the identical request with --idempotency-key {idempotency_key} "
+        f"(request fingerprint {fingerprint}) instead of changing the prompt or options."
+    )
+
+
+def submit_images_request(request_fn, endpoint, model, async_mode, idempotency_key, fingerprint):
+    """Submit an Images request with one idempotent replay for transient failures.
+
+    ``request_fn`` receives the key so multipart requests can reopen their file
+    handle on the replay.  Once both attempts are ambiguous, we stop and retain
+    the key rather than silently creating another billable generation.
+    """
+    attempts = 0
+    while True:
+        try:
+            response = request_fn(idempotency_key)
+        except requests.RequestException as exc:
+            if async_mode and attempts + 1 < IMAGE_SUBMISSION_MAX_ATTEMPTS:
+                attempts += 1
+                print(
+                    "Transient Images submission error; retrying once with the same "
+                    "Idempotency-Key.",
+                    file=sys.stderr,
+                )
+                time.sleep(IMAGE_POLL_MIN_SECONDS)
+                continue
+            if async_mode:
+                ambiguous_image_submission(
+                    f"network error: {exc}",
+                    endpoint,
+                    model,
+                    idempotency_key,
+                    fingerprint,
+                )
+            raise
+
+        if (
+            async_mode
+            and response.status_code in IMAGE_SUBMISSION_RETRY_STATUSES
+            and attempts + 1 < IMAGE_SUBMISSION_MAX_ATTEMPTS
+        ):
+            attempts += 1
+            delay = (
+                retry_after_seconds(response)
+                if response.status_code == 429
+                else IMAGE_POLL_MIN_SECONDS
+            )
+            print(
+                f"Transient Images submission HTTP {response.status_code}; retrying once "
+                "with the same Idempotency-Key.",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+
+        if async_mode and response.status_code in IMAGE_SUBMISSION_RETRY_STATUSES:
+            ambiguous_image_submission(
+                f"HTTP {response.status_code}",
+                endpoint,
+                model,
+                idempotency_key,
+                fingerprint,
+            )
+        return response
+
+
+def await_image_task(cfg, task, timeout):
+    """Poll an Image2 async task until it completes or the budget expires.
+
+    Once a task ID exists, transient 429/5xx responses are handled by polling
+    the same task again.  We never submit a second generation request here.
+    """
+    task_id = task.get("id")
+    if not task_id:
+        fail(f"Async image response is missing an id: {task}")
+
+    deadline = time.monotonic() + max(timeout, IMAGE_POLL_MIN_SECONDS)
+    poll_after = image_poll_after(task.get("poll_after"))
+    last_poll_error = None
+
+    while True:
+        status = str(task.get("status", "")).lower()
+        if status == "completed":
+            return task
+        if status == "failed":
+            error = task.get("error") or {}
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or "生图失败"
+            else:
+                message = str(error)
+            fail(f"Image task {task_id} failed: {message}")
+        if status not in IMAGE_TASK_STATUSES:
+            fail(f"Image task {task_id} returned unexpected status: {status or '(missing)'}")
+
+        if time.monotonic() >= deadline:
+            detail = f"; last poll error: {last_poll_error}" if last_poll_error else ""
+            fail(
+                f"Image task {task_id} still {status} after {timeout}s. "
+                f"It may still finish upstream; continue querying the task instead of resubmitting{detail}."
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        # Keep the documented minimum interval, but avoid sleeping beyond the
+        # caller's budget when a provider asks for a very long delay.
+        time.sleep(min(poll_after, remaining))
+        try:
+            response = requests.get(
+                image_task_url(cfg, task_id),
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                timeout=max(1, min(timeout, int(max(1, remaining)))),
+            )
+        except requests.RequestException as exc:
+            # A poll is idempotent.  Keep the task ID and try again within the
+            # caller's bounded budget instead of creating a duplicate job.
+            last_poll_error = str(exc)
+            poll_after = image_poll_after(None, fallback=poll_after)
+            continue
+
+        if response.status_code == 429:
+            last_poll_error = "HTTP 429"
+            poll_after = retry_after_seconds(response, fallback=poll_after)
+            continue
+        if 500 <= response.status_code <= 599:
+            last_poll_error = f"HTTP {response.status_code}"
+            poll_after = retry_after_seconds(response, fallback=poll_after)
+            continue
+        if response.status_code not in (200, 202):
+            fail(f"Image task poll HTTP {response.status_code}: {error_text(response)}")
+        try:
+            task = response.json()
+        except (ValueError, json.JSONDecodeError):
+            fail(f"Non-JSON image task response: {response.text[:500]}")
+        if not isinstance(task, dict):
+            fail(f"Unexpected image task response: {task}")
+        poll_after = image_poll_after(task.get("poll_after"), fallback=poll_after)
 
 
 def extract_image_bytes_from_responses(payload):
@@ -460,7 +823,7 @@ def probe_endpoint(cfg, endpoint_mode, timeout):
             "detail": f"error ({exc})",
         }
 
-    reachable = response.status_code in (200, 400, 422)
+    reachable = response.status_code in (200, 202, 400, 422)
     if reachable:
         detail = f"{response.status_code} (reachable, generation unverified)"
     else:
@@ -469,20 +832,24 @@ def probe_endpoint(cfg, endpoint_mode, timeout):
 
 
 def read_only_check(cfg, timeout):
-    try:
-        response = requests.get(
-            f"{cfg['base_url']}/models",
-            headers={"Authorization": f"Bearer {cfg['api_key']}"},
-            timeout=timeout,
-            allow_redirects=False,
-        )
-    except requests.RequestException as exc:
-        return {"reachable": False, "detail": f"error ({exc})"}
+    last_detail = "no model-list response"
+    for url in model_list_urls(cfg):
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            last_detail = f"error ({exc})"
+            continue
 
-    return {
-        "reachable": 200 <= response.status_code < 300,
-        "detail": str(response.status_code),
-    }
+        detail = str(response.status_code)
+        if 200 <= response.status_code < 300:
+            return {"reachable": True, "detail": detail}
+        last_detail = detail
+    return {"reachable": False, "detail": last_detail}
 
 
 def probe_endpoints(cfg, timeout):
@@ -525,7 +892,9 @@ def image_generation_tool(args, output_format):
         tool["quality"] = args.quality
     tool["output_format"] = output_format
     if output_format in {"jpeg", "webp"}:
-        tool["output_compression"] = args.compression
+        compression = getattr(args, "compression", None)
+        if compression is not None:
+            tool["output_compression"] = compression
     if getattr(args, "stream", False):
         tool["partial_images"] = PARTIAL_IMAGE_COUNT
     return tool
@@ -564,8 +933,7 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
         if resp.status_code == 200:
             if stream:
                 raw = extract_image_bytes_from_stream(resp)
-                save_resolved_model(cfg, "responses", model)
-                save_last_successful_mode(cfg, "responses")
+                save_generation_success(cfg, "responses", model)
                 return raw, model
             try:
                 payload = resp.json()
@@ -573,8 +941,7 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
                 fail(f"Non-JSON response: {resp.text[:500]}")
             payload = await_background_response(cfg, payload, headers, timeout)
             raw = extract_image_bytes_from_responses(payload)
-            save_resolved_model(cfg, "responses", model)
-            save_last_successful_mode(cfg, "responses")
+            save_generation_success(cfg, "responses", model)
             return raw, model
         if is_model_rejection(resp):
             continue
@@ -587,59 +954,187 @@ def generate_with_responses(cfg, args, timeout, output_format, available_models=
     )
 
 
+def is_http_url(value):
+    parsed = urlparse((value or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def images_payload(args, model, output_format):
+    """Build the portable Images request body used by common gateways.
+
+    Always sending the ordinary single-image, low-quality PNG defaults keeps
+    the payload aligned with compatible synchronous Images implementations.
+    The response parser already accepts both URL and Base64 results, so there
+    is no need to force a provider-specific ``response_format`` field.
+    """
+    payload = {
+        "model": model,
+        "prompt": args.prompt,
+        "n": 1,
+        "output_format": output_format,
+    }
+    if args.size != "auto":
+        payload["size"] = args.size
+    image_size = getattr(args, "image_size", "auto")
+    if image_size != "auto" and ":" in str(args.size):
+        payload["image_size"] = image_size
+    quality = getattr(args, "quality", "auto")
+    if quality != "auto":
+        payload["quality"] = quality
+    if output_format in {"jpeg", "webp"}:
+        compression = getattr(args, "compression", None)
+        if compression is not None:
+            payload["output_compression"] = compression
+    return payload
+
+
+def images_request_url(cfg, edit, async_mode):
+    path = "images/edits" if edit else "images/generations"
+    url = f"{cfg['base_url']}/{path}"
+    return f"{url}?async=true" if async_mode else url
+
+
+def images_headers(cfg, async_mode, json_body=False, idempotency_key=None):
+    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    if async_mode:
+        headers["Idempotency-Key"] = normalize_idempotency_key(idempotency_key) or str(uuid.uuid4())
+    return headers
+
+
+def image_url_shape_error(response):
+    """Some OpenAI-compatible gateways require ``images[].image_url`` objects."""
+    if response.status_code != 400:
+        return False
+    return "images[].image_url" in error_text(response).lower()
+
+
+def parse_images_response(response, cfg, timeout, async_mode):
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        fail(f"Non-JSON Images response: {response.text[:500]}")
+    if not isinstance(payload, dict):
+        fail(f"Unexpected Images response: {payload}")
+
+    if response.status_code == 202:
+        return await_image_task(cfg, payload, timeout)
+    if response.status_code == 200:
+        # A few compatible gateways complete immediately even when async=true.
+        if async_mode and payload.get("status") in IMAGE_TASK_STATUSES:
+            return await_image_task(cfg, payload, timeout)
+        return payload
+    fail(f"Unexpected Images response HTTP {response.status_code}: {error_text(response)}")
+
+
 def generate_with_images(cfg, args, timeout, output_format, available_models=None):
     candidates = model_candidates(cfg, "images", args.model, available_models)
-    for model in candidates:
-        payload = {
-            "model": model,
-            "prompt": args.prompt,
-            "n": 1,
-            "quality": args.quality,
-            "output_format": output_format,
-        }
-        if args.size != "auto":
-            payload["size"] = args.size
-        if output_format in {"jpeg", "webp"}:
-            payload["output_compression"] = args.compression
+    async_mode = getattr(args, "background", False)
+    supplied_key = normalize_idempotency_key(getattr(args, "idempotency_key", None))
+    for candidate_index, model in enumerate(candidates):
+        payload = images_payload(args, model, output_format)
+        edit = bool(args.image)
+        endpoint = images_request_url(cfg, edit, async_mode)
 
-        if args.image:
+        # A model fallback changes the request body, so it must get a fresh key.
+        idempotency_key = (
+            (
+                (supplied_key or str(uuid.uuid4()))
+                if candidate_index == 0
+                else str(uuid.uuid4())
+            )
+            if async_mode
+            else None
+        )
+
+        def submit(request_fn, request_payload, reference_path=None, key=idempotency_key):
+            return submit_images_request(
+                request_fn,
+                endpoint,
+                model,
+                async_mode,
+                key,
+                image_request_fingerprint(
+                    endpoint, request_payload, reference_path=reference_path
+                ),
+            )
+
+        if edit and is_http_url(args.image):
+            json_payload = dict(payload)
+            json_payload["images"] = [args.image.strip()]
+
+            def post_url_edit(key, request_payload=json_payload):
+                return requests.post(
+                    endpoint,
+                    headers=images_headers(
+                        cfg, async_mode, json_body=True, idempotency_key=key
+                    ),
+                    json=request_payload,
+                    timeout=timeout,
+                )
+
+            response = submit(post_url_edit, json_payload)
+            # The Image2 document accepts URL strings, while some gateways
+            # expose the OpenAI-compatible object form.  A validation-only 400
+            # is safe to retry with the alternate shape and a fresh key because
+            # the request body changes.
+            if image_url_shape_error(response):
+                json_payload["images"] = [{"image_url": args.image.strip()}]
+                idempotency_key = str(uuid.uuid4()) if async_mode else None
+                response = submit(post_url_edit, json_payload, key=idempotency_key)
+        elif edit:
             image_path = Path(args.image).expanduser()
             if not image_path.is_file():
                 fail(f"Reference image not found: {image_path}")
             mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
-            with image_path.open("rb") as image_file:
-                resp = requests.post(
-                    f"{cfg['base_url']}/images/edits",
-                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
-                    data={key: str(value) for key, value in payload.items()},
-                    files={"image": (image_path.name, image_file, mime_type)},
+            form_data = {key: str(value) for key, value in payload.items()}
+
+            def post_file_edit(key):
+                # Reopen the file for each attempt; requests consumes the file
+                # stream and a replay must send byte-for-byte identical content.
+                with image_path.open("rb") as image_file:
+                    return requests.post(
+                        endpoint,
+                        headers=images_headers(
+                            cfg, async_mode, idempotency_key=key
+                        ),
+                        data=form_data,
+                        files={"image": (image_path.name, image_file, mime_type)},
+                        timeout=timeout,
+                    )
+
+            response = submit(post_file_edit, form_data, reference_path=image_path)
+        else:
+            def post_generation(key, request_payload=payload):
+                return requests.post(
+                    endpoint,
+                    headers=images_headers(
+                        cfg, async_mode, json_body=True, idempotency_key=key
+                    ),
+                    json=request_payload,
                     timeout=timeout,
                 )
-            used_mode = "edit"
-        else:
-            resp = requests.post(
-                f"{cfg['base_url']}/images/generations",
-                headers={
-                    "Authorization": f"Bearer {cfg['api_key']}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=timeout,
-            )
-            used_mode = "generate"
 
-        if resp.status_code == 200:
-            try:
-                response_payload = resp.json()
-            except json.JSONDecodeError:
-                fail(f"Non-JSON response: {resp.text[:500]}")
-            raw = extract_image_bytes(response_payload, cfg["api_key"], timeout)
-            save_resolved_model(cfg, "images", model)
-            save_last_successful_mode(cfg, "images")
-            return raw, model, used_mode
-        if is_model_rejection(resp):
+            response = submit(post_generation, payload)
+
+        if response.status_code in (200, 202):
+            response_payload = parse_images_response(response, cfg, timeout, async_mode)
+            result_payload = response_payload.get("result", response_payload)
+            raw = extract_image_bytes(result_payload, timeout=timeout)
+            clear_pending_request(idempotency_key)
+            save_generation_success(cfg, "images", model)
+            return raw, model, "edit" if edit else "generate"
+        if is_model_rejection(response):
             continue
-        fail(f"HTTP {resp.status_code}: {error_text(resp)}")
+
+        hint = ""
+        if response.status_code in (502, 503, 504):
+            if async_mode:
+                hint = "；异步提交也失败，请检查网关 Images 上游和模型能力"
+            else:
+                hint = "；可重试 `--background` 走异步 Images 接口，或检查网关 Images 上游"
+        fail(f"HTTP {response.status_code}: {error_text(response)}{hint}")
 
     fail(
         "No configured image model was accepted by "
@@ -655,6 +1150,17 @@ def infer_format(out_path, fmt):
     if suffix in {"png", "jpeg", "jpg", "webp"}:
         return "jpeg" if suffix == "jpg" else suffix
     return "png"
+
+
+def compression_value(raw):
+    """Parse the documented JPEG/WebP compression range (0 through 100)."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("compression must be an integer from 0 to 100") from exc
+    if not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("compression must be an integer from 0 to 100")
+    return value
 
 
 def default_output_path(fmt):
@@ -714,11 +1220,11 @@ def command_generate(args):
     if endpoint_mode == "auto":
         endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout)
 
-    # --background and --stream are Responses-only; reject them before any generation request.
-    if endpoint_mode != "responses":
-        for flag in ("background", "stream"):
-            if getattr(args, flag, False):
-                fail(f"--{flag} requires the responses endpoint, but images was selected")
+    if endpoint_mode == "images":
+        if getattr(args, "stream", False):
+            fail("--stream requires the responses endpoint, but images was selected")
+    elif getattr(args, "background", False) and getattr(args, "stream", False):
+        fail("--background and --stream cannot be used together")
 
     available_models = set()
     if not args.model and not cfg.get("model_cache_is_current"):
@@ -746,7 +1252,11 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     config_parser = sub.add_parser("config", help="Save base URL, API key, and model preferences")
-    config_parser.add_argument("--base", required=True, help="Gateway base URL, with or without /v1")
+    config_parser.add_argument(
+        "--base",
+        required=True,
+        help="Exact gateway API prefix (include /v1 only when the provider requires it)",
+    )
     config_parser.add_argument("--key", help="API key; omit to enter it without echoing")
     config_parser.add_argument("--model", default="auto", help="Preferred model or auto")
     config_parser.add_argument(
@@ -780,22 +1290,42 @@ def build_parser():
     gen_parser.add_argument("--prompt", required=True, help="Prompt text")
     gen_parser.add_argument("--out", help="Target file path; defaults to ./generated/image-YYYYMMDD-HHMMSS.<format>")
     gen_parser.add_argument("--image", help="Reference image path for edit mode")
-    gen_parser.add_argument("--size", default="1024x1024", help="Image size or auto")
-    gen_parser.add_argument("--quality", default="auto", choices=["auto", "low", "medium", "high"])
+    gen_parser.add_argument("--size", default="1024x1024", help="Image size/ratio or auto")
+    gen_parser.add_argument(
+        "--image-size",
+        default="auto",
+        choices=["auto", "1K", "2K", "4K"],
+        help="Resolution tier for ratio sizes on the Images endpoint",
+    )
+    gen_parser.add_argument("--quality", default="low", choices=["auto", "low", "medium", "high"])
     gen_parser.add_argument("--format", choices=["png", "jpeg", "webp"], help="Output format")
-    gen_parser.add_argument("--compression", type=int, default=100, help="Compression for jpeg/webp")
+    gen_parser.add_argument(
+        "--compression",
+        type=compression_value,
+        default=None,
+        help="Compression for jpeg/webp (only sent when explicitly set)",
+    )
     gen_parser.add_argument("--model", help="Override model")
+    gen_parser.add_argument(
+        "--idempotency-key",
+        help="Reuse this key to safely replay an ambiguous --background Images submission",
+    )
     gen_parser.add_argument(
         "--background",
         action="store_true",
-        help="Run responses-endpoint generation asynchronously and poll until it completes.",
+        help="Use the async Images/Responses route and poll until completion.",
     )
     gen_parser.add_argument(
         "--stream",
         action="store_true",
         help="Stream responses-endpoint events and save only the final image.",
     )
-    gen_parser.add_argument("--timeout", type=int, default=120, help="HTTP timeout in seconds")
+    gen_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="HTTP timeout and async task polling budget in seconds",
+    )
     gen_parser.set_defaults(func=command_generate)
 
     return parser
