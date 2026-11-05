@@ -15,6 +15,7 @@ The skill lets a user:
 - diagnose endpoint reachability and preserve an explicit endpoint choice
 - generate an image from text and save it to a local file path
 - generate a new image from a reference image and prompt
+- generate an animated GIF from text or a local reference on supported GPT Image 2.6 gateways
 
 ## Install
 
@@ -73,6 +74,99 @@ python3 ~/.agents/skills/openai-image-gateway/scripts/openai_image_gateway.py ge
 
 ## Gateway request shapes
 
+### Animated GIFs
+
+Install the GIF validation dependency once:
+
+```bash
+python3 -m pip install Pillow
+```
+
+GIF behavior follows the selected gateway contract:
+
+| GIF profile | Frame count | Default frames | Reference-image GIF |
+| --- | --- | --- | --- |
+| `cx` | 2–16 | 6 | Local file uploaded as `image[]` |
+| `generic` | 2–64 | 9 | Not enabled |
+| `auto` (configuration default) | Selected by host | Selected by host | Uses `cx` for the exact documented CX host, otherwise `generic` |
+
+The documented host is `api.www-cx-api.cn.mt`. A configured `gif_profile` or
+per-generation `--gif-profile` overrides automatic host selection. To use the
+same contract through a different domain, choose `--gif-profile cx` explicitly.
+Existing configurations without a `gif_profile` use `auto`; saving config
+without this option preserves any previously configured profile.
+
+From the repository root, generate a text-to-GIF animation:
+
+```bash
+python3 skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --gif-profile cx \
+  --model gpt-image-2.6-flare \
+  --prompt "A red ball bounces above a gray line on a white background. Keep the camera still and loop smoothly." \
+  --format gif \
+  --frame-count 6 \
+  --frame-duration-ms 200 \
+  --size auto \
+  --out ./generated/bouncing-ball.gif
+```
+
+Generate a GIF from a local reference image:
+
+```bash
+python3 skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --gif-profile cx \
+  --model gpt-image-2.6-flare \
+  --image ./reference.png \
+  --prompt "Animate the blue ball bouncing up and down. Keep the reference background and colors, with a smooth loop." \
+  --format gif \
+  --frame-count 4 \
+  --frame-duration-ms 240 \
+  --out ./generated/reference-animation.gif
+```
+
+The first example requests 1.2 seconds (6 × 200 ms); the second requests
+0.96 seconds (4 × 240 ms). The CX profile sends text requests as JSON to
+`<base>/images/generations`, and reference requests as multipart form data to
+`<base>/images/edits`, using the literal `image[]` field. Its defaults include
+`size=auto`, `stream=false`, and `response_format=url`. Use a key whose group
+has Image 2.6 GIF access; the model list alone does not prove GIF permission.
+
+- GIF uses Images only. Explicit `responses` mode, `--stream`, `--compression`,
+  and `--image-size` are rejected before generation. In `auto` endpoint mode,
+  GIF goes directly to Images without a generation probe or config change.
+- `--image` accepts one local reference file for CX GIF. Download URL references
+  to a local file yourself before use; no undocumented URL-edit request is
+  inferred. Other profiles retain the text-only GIF restriction.
+- `.gif` output paths infer GIF format. `--frame-count` and
+  `--frame-duration-ms` are GIF-only; the frame delay range is 20–2000 ms and
+  defaults to 200. `generic` retains its previous 9-frame default and 64-frame
+  client limit; the gateway may enforce stricter access or pixel limits.
+- GIF defaults to automatic frame size. Explicit dimensions must be positive
+  multiples of 16. The provider may choose a different final canvas; use the
+  actual output dimensions when assessing the result.
+- `--response-format url|b64_json` is an optional Images-only request parameter.
+  It controls the server's return transport, while `--format` controls the
+  actual image format. CX GIF defaults to URL; generic/static requests omit
+  this field unless selected. Base64 transport must also be supported by the
+  provider. Both returned URLs and Base64 are downloaded/decoded and saved.
+- Explicit model names and provider aliases stay pinned. Automatic GIF model
+  selection only considers GPT Image 2.6 Sunburst/Flare. Fallback happens only
+  after definitive model rejection; ambiguous failures never switch GIF models.
+- GIF validation checks block boundaries, termination, multiple frames, and
+  decodability before caching success or replacing output. Returned bytes are
+  preserved without re-encoding. Missing Pillow fails before submission.
+- `--background` retains the existing optional gateway async route and
+  same-body/key retry behavior. The supplied CX documentation establishes
+  synchronous non-streaming generation; async GIF support is provider-dependent
+  and has only offline verification here.
+
+CX behavior follows the gateway request examples supplied for this project;
+GIF edits are not assumed to be supported by every OpenAI-compatible provider.
+The generic text-to-GIF shape follows the
+[OpenAI GIF guide](https://developers.openai.com/api/docs/guides/image-generation).
+
+### Static images and async gateway routes
+
 When `--endpoint-mode images` is configured, the CLI uses Image2's synchronous
 route by default (`POST <base>/images/generations` or
 `POST <base>/images/edits`). The default request matches the working Image2
@@ -97,7 +191,7 @@ post-completion download error and never re-submits the billable image request.
   or a public HTTP(S) URL (`images`). URL arrays are retried in the
   `{"image_url": "..."}` object shape when a compatible gateway explicitly
   asks for that form.
-- Synchronous Images generation continues through configured image-model
+- Synchronous static Images generation continues through configured image-model
   candidates after HTTP or transport failures; async submissions stay bound
   to one idempotency key and task.
 - `--format` controls both the requested `output_format` and the local file
@@ -105,7 +199,8 @@ post-completion download error and never re-submits the billable image request.
   the selected Images model.
 
 `--background` enables the async route for both Images and Responses endpoints.
-Images requests do not force `response_format`; the client accepts either URL
+Unless the CX GIF profile or `--response-format` selects a transport, Images
+requests omit `response_format`; the client accepts either URL
 or Base64 responses, matching the gateway's native response shape.
 For an async submission that ends in a connection reset or transient `429`/
 `5xx`, the client performs one replay with the same `Idempotency-Key`. If the
@@ -144,6 +239,9 @@ If all candidates are rejected, the skill reports the endpoint and attempted mod
 
 - Python 3
 - `requests`
+- `Pillow` for GIF validation and the GIF regression tests (optional for static images)
+
+Run the offline regression tests with `python3 -m unittest discover -v`.
 
 ## Endpoint Selection
 

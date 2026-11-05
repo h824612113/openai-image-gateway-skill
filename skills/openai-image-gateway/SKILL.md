@@ -1,6 +1,6 @@
 ---
 name: openai-image-gateway
-description: Use an OpenAI-compatible image gateway for text-to-image or reference-image generation with one-time local config. Trigger when the user asks to generate an image through a configured gateway, use a reference image, test gateway connectivity, update gateway settings, or save generated output to a specified local path.
+description: Use an OpenAI-compatible image gateway for text-to-image, GPT Image 2.6 animated GIF, or reference-image generation with one-time local config. Trigger when the user asks to generate an image or GIF through a configured gateway, use a reference image, test gateway connectivity, update gateway settings, or save generated output to a specified local path.
 ---
 
 # OpenAI Image Gateway
@@ -16,6 +16,7 @@ Use this skill when the user wants a reusable local image-generation workflow ba
 - Records `last_successful_mode` only after a real image is returned
 - Generates an image from text and saves it to a user-specified local path
 - Generates a new image from a reference image and prompt
+- Generates a looping GIF with GPT Image 2.6, from text or a local reference on supported gateways, with frame count and timing controls
 
 ## Common Chinese invocations
 
@@ -25,6 +26,7 @@ Use this skill when the user wants a reusable local image-generation workflow ba
 
 - `用 openai-image-gateway 生图，输出到 /path/to/file.png`
 - `用图片网关生图，保存到 /path/to/file.png`
+- `用图片网关生成 GIF 动图，保存到 /path/to/animation.gif`
 - `生成图片并输出到 /path/to/file.png`
 - `用 openai-image-gateway 测一下连接`
 - `用 openai-image-gateway 重新配置 url 和 key`
@@ -93,13 +95,85 @@ Optional generation overrides:
 - `--image /path/to/reference.png`
 - `--size 1024x1024`
 - `--quality low|medium|high|auto`
-- `--format png|jpeg|webp`
+- `--format png|jpeg|webp|gif`
+- `--gif-profile auto|generic|cx` (GIF contract; CLI overrides saved config)
+- `--frame-count N` (GIF only; CX: 2-16/default 6; generic: 2-64/default 9)
+- `--frame-duration-ms 20-2000` (GIF only; default 200)
+- `--response-format url|b64_json` (Images return transport; CX GIF defaults to URL)
 - `--compression 0-100`
 - `--model MODEL_NAME`
 - `--idempotency-key KEY` (reuse a key after an ambiguous async Images submission)
 - `--timeout SECONDS`
 - `--background` (use the async Images/Responses route and poll until completion)
 - `--stream` (responses endpoint only; stream progress and save only the final image)
+
+### Generate an animated GIF
+
+GIF output requires `Pillow`. If missing, run
+`python3 -m pip install Pillow`; the CLI checks it before submitting.
+
+Text-to-GIF using the CX gateway contract:
+
+```bash
+python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --gif-profile cx \
+  --model gpt-image-2.6-flare \
+  --prompt "白色背景上，红球在灰线上方弹跳，固定镜头，无缝循环" \
+  --format gif \
+  --frame-count 6 \
+  --frame-duration-ms 200 \
+  --out /Users/hanhao/Downloads/output_images/bouncing-ball.gif
+```
+
+Reference-image-to-GIF:
+
+```bash
+python3 /Users/hanhao/.codex/skills/openai-image-gateway/scripts/openai_image_gateway.py generate \
+  --gif-profile cx \
+  --model gpt-image-2.6-flare \
+  --image /path/to/reference.png \
+  --prompt "让参考图中的蓝色圆球上下弹跳，保留背景和配色，无缝循环" \
+  --format gif \
+  --frame-count 4 \
+  --frame-duration-ms 240 \
+  --out /Users/hanhao/Downloads/output_images/reference-animation.gif
+```
+
+- `gif_profile` can be saved with `config --gif-profile auto|generic|cx`.
+  `generate --gif-profile` overrides it for one request. `auto` is the default
+  for old/new config and selects CX only for the exact documented hostname
+  `api.www-cx-api.cn.mt`; all other hosts use generic unless explicitly chosen.
+- CX GIF supports 2–16 frames, default 6, and one local reference image.
+  Text requests use JSON `/images/generations`; reference requests use
+  multipart `/images/edits` with `image[]`. Booleans use lowercase `false` in
+  multipart fields. URL-reference GIF edits are not implemented; ask for a
+  local file rather than inventing an undocumented request shape.
+- CX GIF defaults to `size=auto`, `stream=false`, `response_format=url`,
+  `frame_count=6`, and `frame_duration_ms=200`. A group key must have GIF access;
+  model-list visibility is not a generation or permission test.
+- Generic GIF retains text-only Images generation, 2–64 frames and default 9.
+  Do not enable provider-specific image edits on an unverified gateway merely
+  because its model name includes 2.6.
+- Both profiles use a 20–2000 ms frame delay, default 200. Animation flags are
+  GIF-only. Explicit GIF dimensions must be positive multiples of 16, but the
+  provider determines the actual finished canvas. Static output still defaults
+  to 1024x1024; GIF defaults to automatic sizing.
+- `.gif` paths infer GIF output. Reject conflicting extensions, `--stream`,
+  `--compression`, `--image-size`, and explicit Responses endpoint mode. Auto
+  endpoint mode selects Images without a generation probe or saved-mode change.
+- `--response-format url|b64_json` controls Images return transport; it does
+  not change the file format. Base64 transport requires provider support.
+  Download `data[0].url` without the gateway token, or decode compatible Base64.
+- Pin explicit GIF models/aliases. Automatic GIF selection considers only
+  supported GPT Image 2.6 Sunburst/Flare names. Never switch models after an
+  ambiguous submission. Reference retries reopen the file and preserve the
+  same request body and idempotency key.
+- Validate GIF block boundaries, termination, all frames and multiple-frame
+  animation before caching success or replacing output. Preserve original
+  bytes; never assemble preview frames into an animation.
+- `--background` remains an optional gateway async Images workflow. The CX
+  examples establish synchronous non-streaming GIF behavior; do not promise
+  async GIF support without a provider-specific live test.
 
 When `endpoint_mode` is `images`, the CLI uses Image2's synchronous route by
 default, matching gateways that expose Images at the configured base URL:
@@ -131,11 +205,12 @@ Pass `--background` to opt into the async route:
   public HTTP(S) URL (`images`). If the gateway returns the explicit
   `images[].image_url is required` validation error, the URL is retried in the
   object form `{"image_url": "..."}`.
-- Synchronous Images requests try the next configured image model after HTTP
+- Synchronous static Images requests try the next configured image model after HTTP
   or transport failures. Async requests keep the same task/idempotency key and
   never switch models after a submission becomes ambiguous.
 
-Images requests do not force `response_format`; the parser accepts either URL
+Except for CX GIF's URL default or an explicit `--response-format`, Images
+requests omit `response_format`; the parser accepts either URL
 or Base64 output. `--background` explicitly enables async mode and is accepted
 for both endpoints.
 

@@ -3,6 +3,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -18,13 +19,20 @@ import requests
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_DIR / "local_config.json"
+GIF_MODEL_CANDIDATES = (
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+)
 DEFAULT_MODEL_CANDIDATES = (
     "gpt-image-2",
+    *GIF_MODEL_CANDIDATES,
     "gpt-image-1.5",
     "gpt-image-1",
     "gpt-image",
 )
 ENDPOINT_MODES = ("auto", "images", "responses")
+GIF_PROFILES = ("auto", "generic", "cx")
+CX_GIF_HOST = "api.www-cx-api.cn.mt"
 BACKGROUND_POLL_SECONDS = 2
 IMAGE_POLL_MIN_SECONDS = 5
 IMAGE_TASK_STATUSES = {"queued", "in_progress"}
@@ -115,10 +123,13 @@ def load_config():
     model_candidates = [str(item).strip() for item in model_candidates if str(item).strip()]
     resolved_model = (data.get("resolved_model", "") or "").strip()
     endpoint_mode = (data.get("endpoint_mode", "auto") or "auto").strip().lower()
+    gif_profile = (data.get("gif_profile", "auto") or "auto").strip().lower()
     if not base_url or not api_key:
         fail(f"Config incomplete: {CONFIG_PATH}")
     if endpoint_mode not in ENDPOINT_MODES:
         fail(f"Invalid endpoint_mode in {CONFIG_PATH}: {endpoint_mode}")
+    if gif_profile not in GIF_PROFILES:
+        fail(f"Invalid gif_profile in {CONFIG_PATH}: {gif_profile}")
     current_fingerprint = endpoint_fingerprint(raw_base_url, api_key)
     last_successful_mode = (data.get("last_successful_mode", "") or "").strip().lower()
     last_successful_mode_is_current = bool(
@@ -154,6 +165,7 @@ def load_config():
             and active_model_mode in ("images", "responses")
         ),
         "endpoint_mode": endpoint_mode,
+        "gif_profile": gif_profile,
         "endpoint_fingerprint": current_fingerprint,
         "last_successful_mode": last_successful_mode,
         "last_successful_mode_is_current": last_successful_mode_is_current,
@@ -167,7 +179,7 @@ def write_config(payload):
     os.chmod(CONFIG_PATH, 0o600)
 
 
-def save_config(base_url, api_key, model, responses_model, endpoint_mode):
+def save_config(base_url, api_key, model, responses_model, endpoint_mode, gif_profile=None):
     existing = {}
     if CONFIG_PATH.exists():
         try:
@@ -183,7 +195,10 @@ def save_config(base_url, api_key, model, responses_model, endpoint_mode):
         "model": (model or "auto").strip() or "auto",
         "responses_model": (responses_model or "").strip(),
         "endpoint_mode": endpoint_mode,
+        "gif_profile": gif_profile if gif_profile is not None else existing.get("gif_profile", "auto"),
     }
+    if payload["gif_profile"] not in GIF_PROFILES:
+        fail(f"Invalid GIF profile: {payload['gif_profile']}")
     if isinstance(existing.get("model_candidates"), list):
         payload["model_candidates"] = existing["model_candidates"]
     if existing.get("last_successful_mode_fingerprint") == fingerprint:
@@ -198,6 +213,14 @@ def save_config(base_url, api_key, model, responses_model, endpoint_mode):
     print(f"Model: {payload['model']}")
     print(f"Responses model: {payload['responses_model'] or '(uses image model candidates)'}")
     print(f"Endpoint mode: {payload['endpoint_mode']}")
+    print(f"GIF profile: {payload['gif_profile']}")
+
+
+def resolve_gif_profile(cfg, args):
+    profile = getattr(args, "gif_profile", None) or cfg.get("gif_profile", "auto")
+    if profile == "auto":
+        return "cx" if urlparse(cfg["base_url"]).hostname == CX_GIF_HOST else "generic"
+    return profile
 
 
 def save_endpoint_mode(endpoint_mode):
@@ -269,6 +292,23 @@ def model_list_urls(cfg):
     if not parsed.path.rstrip("/"):
         candidates.append(f"{base_url}/v1/models")
     return tuple(candidates)
+
+
+def gif_model_candidates(cfg, override_model=None, available_models=None):
+    # An explicit gateway alias must remain pinned; a rejected animation must
+    # never silently fall back to a static-image model.
+    if override_model:
+        return [override_model]
+    candidates = model_candidates(cfg, "images", available_models=available_models)
+    compatible = [
+        model for model in candidates
+        if any(model == name or model.startswith(f"{name}-") for name in GIF_MODEL_CANDIDATES)
+    ]
+    if available_models:
+        compatible = [model for model in compatible if model in available_models]
+        if not compatible:
+            fail("No GIF-capable GPT Image 2.6 model is listed. Use --model for a provider GIF alias.")
+    return compatible or list(GIF_MODEL_CANDIDATES)
 
 
 def fetch_available_models(cfg, timeout):
@@ -886,8 +926,9 @@ def encode_image_data_url(image_path):
 
 def image_generation_tool(args, output_format):
     tool = {"type": "image_generation"}
-    if args.size != "auto":
-        tool["size"] = args.size
+    size = args.size or "1024x1024"
+    if size != "auto":
+        tool["size"] = size
     if args.quality != "auto":
         tool["quality"] = args.quality
     tool["output_format"] = output_format
@@ -977,10 +1018,12 @@ def images_payload(args, model, output_format):
         "n": 1,
         "output_format": output_format,
     }
-    if args.size != "auto":
-        payload["size"] = args.size
+    size = args.size or ("auto" if output_format == "gif" else "1024x1024")
+    cx_gif = output_format == "gif" and getattr(args, "resolved_gif_profile", "generic") == "cx"
+    if size != "auto" or cx_gif:
+        payload["size"] = size
     image_size = getattr(args, "image_size", "auto")
-    if image_size != "auto" and ":" in str(args.size):
+    if image_size != "auto" and ":" in str(size):
         payload["image_size"] = image_size
     quality = getattr(args, "quality", "auto")
     if quality != "auto":
@@ -989,6 +1032,14 @@ def images_payload(args, model, output_format):
         compression = getattr(args, "compression", None)
         if compression is not None:
             payload["output_compression"] = compression
+    if output_format == "gif":
+        payload["frame_count"] = getattr(args, "frame_count", None) or (6 if cx_gif else 9)
+        payload["frame_duration_ms"] = getattr(args, "frame_duration_ms", None) or 200
+        if cx_gif:
+            payload["stream"] = False
+    response_format = getattr(args, "response_format", None) or ("url" if cx_gif else None)
+    if response_format:
+        payload["response_format"] = response_format
     return payload
 
 
@@ -1033,7 +1084,11 @@ def parse_images_response(response, cfg, timeout, async_mode):
 
 
 def generate_with_images(cfg, args, timeout, output_format, available_models=None):
-    candidates = model_candidates(cfg, "images", args.model, available_models)
+    candidates = (
+        gif_model_candidates(cfg, args.model, available_models)
+        if output_format == "gif"
+        else model_candidates(cfg, "images", args.model, available_models)
+    )
     async_mode = getattr(args, "background", False)
     supplied_key = normalize_idempotency_key(getattr(args, "idempotency_key", None))
     for candidate_index, model in enumerate(candidates):
@@ -1081,7 +1136,7 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             try:
                 response = submit(post_url_edit, json_payload)
             except requests.RequestException as exc:
-                if candidate_index + 1 < len(candidates):
+                if output_format != "gif" and candidate_index + 1 < len(candidates):
                     print(
                         f"Image model {model} failed with network error {exc}; "
                         "trying the next configured model.",
@@ -1099,7 +1154,7 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                 try:
                     response = submit(post_url_edit, json_payload, key=idempotency_key)
                 except requests.RequestException as exc:
-                    if candidate_index + 1 < len(candidates):
+                    if output_format != "gif" and candidate_index + 1 < len(candidates):
                         print(
                             f"Image model {model} failed with network error {exc}; "
                             "trying the next configured model.",
@@ -1112,7 +1167,15 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             if not image_path.is_file():
                 fail(f"Reference image not found: {image_path}")
             mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
-            form_data = {key: str(value) for key, value in payload.items()}
+            form_data = {
+                key: json.dumps(value) if isinstance(value, bool) else str(value)
+                for key, value in payload.items()
+            }
+            image_field = (
+                "image[]"
+                if output_format == "gif" and getattr(args, "resolved_gif_profile", "generic") == "cx"
+                else "image"
+            )
 
             def post_file_edit(key):
                 # Reopen the file for each attempt; requests consumes the file
@@ -1124,14 +1187,14 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
                             cfg, async_mode, idempotency_key=key
                         ),
                         data=form_data,
-                        files={"image": (image_path.name, image_file, mime_type)},
+                        files={image_field: (image_path.name, image_file, mime_type)},
                         timeout=timeout,
                     )
 
             try:
                 response = submit(post_file_edit, form_data, reference_path=image_path)
             except requests.RequestException as exc:
-                if candidate_index + 1 < len(candidates):
+                if output_format != "gif" and candidate_index + 1 < len(candidates):
                     print(
                         f"Image model {model} failed with network error {exc}; "
                         "trying the next configured model.",
@@ -1153,7 +1216,7 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             try:
                 response = submit(post_generation, payload)
             except requests.RequestException as exc:
-                if candidate_index + 1 < len(candidates):
+                if output_format != "gif" and candidate_index + 1 < len(candidates):
                     print(
                         f"Image model {model} failed with network error {exc}; "
                         "trying the next configured model.",
@@ -1166,6 +1229,8 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             response_payload = parse_images_response(response, cfg, timeout, async_mode)
             result_payload = response_payload.get("result", response_payload)
             raw = extract_image_bytes(result_payload, timeout=timeout)
+            if output_format == "gif":
+                validate_gif_output(raw)
             clear_pending_request(idempotency_key)
             save_generation_success(cfg, "images", model)
             return raw, model, "edit" if edit else "generate"
@@ -1173,12 +1238,14 @@ def generate_with_images(cfg, args, timeout, output_format, available_models=Non
             continue
 
         hint = ""
-        if response.status_code in (502, 503, 504):
+        if output_format == "gif" and response.status_code in IMAGE_DOWNLOAD_RETRY_STATUSES:
+            hint = "; GIF submission may already have completed; do not resubmit automatically"
+        elif response.status_code in (502, 503, 504):
             if async_mode:
                 hint = "；异步提交也失败，请检查网关 Images 上游和模型能力"
             else:
                 hint = "；可重试 `--background` 走异步 Images 接口，或检查网关 Images 上游"
-        if not async_mode and candidate_index + 1 < len(candidates):
+        if output_format != "gif" and not async_mode and candidate_index + 1 < len(candidates):
             print(
                 f"Image model {model} failed with HTTP {response.status_code}; "
                 "trying the next configured model.",
@@ -1198,9 +1265,123 @@ def infer_format(out_path, fmt):
     if fmt:
         return fmt
     suffix = Path(out_path).suffix.lower().lstrip(".")
-    if suffix in {"png", "jpeg", "jpg", "webp"}:
+    if suffix in {"png", "jpeg", "jpg", "webp", "gif"}:
         return "jpeg" if suffix == "jpg" else suffix
     return "png"
+
+
+def animation_integer(raw, minimum, maximum, name):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"{name} must be an integer from {minimum} to {maximum}") from exc
+    if not minimum <= value <= maximum:
+        raise argparse.ArgumentTypeError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def gif_decoder():
+    try:
+        from PIL import Image
+    except ImportError:
+        fail("GIF output requires Pillow. Install it with: python3 -m pip install Pillow")
+    return Image
+
+
+def validate_generation_options(args, out_path, output_format, gif_profile="generic"):
+    if output_format != "gif":
+        if out_path.suffix.lower() == ".gif":
+            fail("A .gif output path requires --format gif (or omit --format to infer it)")
+        if args.frame_count is not None or args.frame_duration_ms is not None:
+            fail("--frame-count and --frame-duration-ms require GIF output")
+        if getattr(args, "gif_profile", None) is not None:
+            fail("--gif-profile requires GIF output")
+        return
+
+    if out_path.suffix and out_path.suffix.lower() != ".gif":
+        fail("GIF output requires a .gif file extension (or a path without an extension)")
+    if gif_profile == "cx" and args.frame_count is not None and args.frame_count > 16:
+        fail("The cx GIF profile supports 2-16 frames (default 6)")
+    if args.image:
+        if gif_profile != "cx":
+            fail("Reference-image GIF output requires --gif-profile cx and a supporting gateway")
+        if is_http_url(args.image):
+            fail("The cx GIF profile requires a local --image file uploaded as image[]")
+        if not Path(args.image).expanduser().is_file():
+            fail(f"Reference image not found: {args.image}")
+    if args.stream:
+        fail("GIF output does not support --stream")
+    if args.compression is not None:
+        fail("GIF output does not support --compression")
+    if args.image_size != "auto":
+        fail("GIF output uses --size WIDTHxHEIGHT or auto, not --image-size")
+    if args.size and args.size != "auto":
+        try:
+            width, height = (int(part) for part in args.size.split("x"))
+        except (ValueError, TypeError):
+            fail("GIF --size must be auto or WIDTHxHEIGHT with positive multiples of 16")
+        if width <= 0 or height <= 0 or width % 16 or height % 16:
+            fail("GIF --size dimensions must be positive multiples of 16")
+    # Check the optional dependency before a potentially billable submission.
+    gif_decoder()
+
+
+def validate_gif_structure(raw):
+    """Check block boundaries that Pillow's tolerant GIF decoder can ignore."""
+    if len(raw) < 14 or raw[:6] not in (b"GIF87a", b"GIF89a"):
+        raise ValueError("Invalid GIF header")
+    packed = raw[10]
+    offset = 13 + (3 * (2 << (packed & 7)) if packed & 128 else 0)
+    while offset < len(raw):
+        marker = raw[offset]
+        offset += 1
+        if marker == 0x3B:
+            if offset != len(raw):
+                raise ValueError("Unexpected data after GIF trailer")
+            return
+        if marker == 0x21:
+            # Extensions have a label followed by length-prefixed sub-blocks.
+            offset += 1
+        elif marker == 0x2C:
+            if offset + 9 > len(raw):
+                raise ValueError("Truncated GIF image descriptor")
+            packed = raw[offset + 8]
+            offset += 9 + (3 * (2 << (packed & 7)) if packed & 128 else 0)
+            offset += 1  # LZW minimum code size; Pillow validates image data.
+        else:
+            raise ValueError("Invalid GIF block marker")
+        while True:
+            if offset >= len(raw):
+                raise ValueError("Unterminated GIF sub-blocks")
+            count = raw[offset]
+            offset += 1
+            if count == 0:
+                break
+            offset += count
+            if offset > len(raw):
+                raise ValueError("Truncated GIF sub-block")
+    raise ValueError("Missing GIF trailer")
+
+
+def validate_gif_output(raw):
+    image_module = gif_decoder()
+    reason = ""
+    try:
+        validate_gif_structure(raw)
+        with image_module.open(io.BytesIO(raw)) as image:
+            if image.format != "GIF" or image.n_frames < 2:
+                reason = "the result is not a multi-frame GIF"
+            else:
+                for frame in range(image.n_frames):
+                    image.seek(frame)
+                    image.load()
+    except (OSError, ValueError, EOFError, image_module.DecompressionBombError):
+        reason = "the result is invalid or truncated"
+    if reason:
+        fail(
+            f"Expected an animated GIF, but {reason}. Output was not replaced. "
+            "The generation already completed; do not resubmit automatically."
+        )
 
 
 def compression_value(raw):
@@ -1231,6 +1412,7 @@ def command_config(args):
         args.model,
         args.responses_model,
         args.endpoint_mode,
+        args.gif_profile,
     )
 
 
@@ -1262,12 +1444,22 @@ def command_test(args):
 
 
 def command_generate(args):
-    cfg = load_config()
     out_path = Path(args.out).expanduser() if args.out else default_output_path(args.format)
+    output_format = infer_format(str(out_path), args.format)
+    cfg = load_config()
+    args.resolved_gif_profile = resolve_gif_profile(cfg, args)
+    validate_generation_options(args, out_path, output_format, args.resolved_gif_profile)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_format = infer_format(str(out_path), args.format)
     endpoint_mode = cfg["endpoint_mode"]
+    if output_format == "gif":
+        if endpoint_mode == "responses":
+            fail("GIF output requires the images endpoint; configure --endpoint-mode images or auto")
+        endpoint_mode = "images"
+    if args.response_format:
+        if endpoint_mode == "responses":
+            fail("--response-format requires the images endpoint")
+        endpoint_mode = "images"
     if endpoint_mode == "auto":
         endpoint_mode, _ = select_endpoint_mode(cfg, args.timeout)
 
@@ -1278,7 +1470,7 @@ def command_generate(args):
         fail("--background and --stream cannot be used together")
 
     available_models = set()
-    if not args.model and not cfg.get("model_cache_is_current"):
+    if not args.model and (output_format == "gif" or not cfg.get("model_cache_is_current")):
         available_models = fetch_available_models(cfg, args.timeout)
 
     if endpoint_mode == "responses":
@@ -1296,6 +1488,8 @@ def command_generate(args):
     print(f"Bytes: {len(raw)}")
     print(f"Model: {used_model}")
     print(f"Mode: {used_mode}")
+    if output_format == "gif":
+        print(f"GIF profile: {args.resolved_gif_profile}")
 
 
 def build_parser():
@@ -1322,6 +1516,10 @@ def build_parser():
         help="Use images or responses directly, or auto-detect once during generation.",
     )
     config_parser.set_defaults(func=command_config)
+    config_parser.add_argument(
+        "--gif-profile", choices=GIF_PROFILES, default=None,
+        help="GIF contract: auto detects the documented CX host; cx enables reference GIFs (2-16 frames, default 6)",
+    )
 
     test_parser = sub.add_parser("test", help="Diagnose image endpoint reachability without generating")
     test_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
@@ -1340,8 +1538,8 @@ def build_parser():
     gen_parser = sub.add_parser("generate", help="Generate an image to a target path")
     gen_parser.add_argument("--prompt", required=True, help="Prompt text")
     gen_parser.add_argument("--out", help="Target file path; defaults to ./generated/image-YYYYMMDD-HHMMSS.<format>")
-    gen_parser.add_argument("--image", help="Reference image path for edit mode")
-    gen_parser.add_argument("--size", default="1024x1024", help="Image size/ratio or auto")
+    gen_parser.add_argument("--image", help="Reference image path for edit mode; GIF references require the cx profile")
+    gen_parser.add_argument("--size", help="Image size/ratio or auto; defaults to 1024x1024, or auto for GIF")
     gen_parser.add_argument(
         "--image-size",
         default="auto",
@@ -1349,7 +1547,25 @@ def build_parser():
         help="Resolution tier for ratio sizes on the Images endpoint",
     )
     gen_parser.add_argument("--quality", default="low", choices=["auto", "low", "medium", "high"])
-    gen_parser.add_argument("--format", choices=["png", "jpeg", "webp"], help="Output format")
+    gen_parser.add_argument("--format", choices=["png", "jpeg", "webp", "gif"], help="Output format")
+    gen_parser.add_argument(
+        "--gif-profile", choices=GIF_PROFILES, default=None,
+        help="Override the configured GIF contract: cx supports local reference GIFs, 2-16 frames, default 6",
+    )
+    gen_parser.add_argument(
+        "--response-format", choices=["url", "b64_json"],
+        help="Images API return transport; cx GIF defaults to url (local output still uses --format)",
+    )
+    gen_parser.add_argument(
+        "--frame-count",
+        type=lambda raw: animation_integer(raw, 2, 64, "frame-count"),
+        help="GIF frames: generic 2-64/default 9; cx 2-16/default 6",
+    )
+    gen_parser.add_argument(
+        "--frame-duration-ms",
+        type=lambda raw: animation_integer(raw, 20, 2000, "frame-duration-ms"),
+        help="GIF delay per frame in milliseconds (20-2000; default 200; API rounds to 10 ms)",
+    )
     gen_parser.add_argument(
         "--compression",
         type=compression_value,

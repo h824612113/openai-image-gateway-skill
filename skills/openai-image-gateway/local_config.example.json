@@ -4,8 +4,11 @@
   "model": "gpt-image-2",
   "responses_model": "gpt-5.4",
   "endpoint_mode": "images",
+  "gif_profile": "auto",
   "model_candidates": [
     "gpt-image-2",
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
     "gpt-image-1.5",
     "gpt-image-1",
     "gpt-image"
